@@ -226,7 +226,11 @@ def list_elements(set_name: str) -> list[str]:
 
 
 def element_exists(set_name: str, ip: str) -> bool:
-    return ip in list_elements(set_name)
+    # Exact kernel-side membership check: 'nft get element' succeeds when the
+    # address falls inside a stored interval (auto-merge may have folded
+    # adjacent entries into ranges, so string-matching a dump is unreliable).
+    rc, _, _ = _run("get", "element", NFT_FAMILY, NFT_TABLE, set_name, f"{{ {ip} }}")
+    return rc == 0
 
 
 # ---------------------------------------------------------------------------
