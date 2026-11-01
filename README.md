@@ -83,6 +83,25 @@ The installer detects **cPanel/WHM** and **Plesk**. When one is found, it shows 
 
 The SSH port is detected separately and always stays open in either mode.
 
+## Migrating from CSF / UFW / firewalld
+
+The installer detects an existing firewall and inherits its rules into
+fwsec automatically — the previous firewall is only removed **after** fwsec
+is up and filtering (zero-open-window order, with a full backup under
+`/root/fwsec-migration-<timestamp>/`).
+
+| Source | Inherited |
+|---|---|
+| **CSF** | `TCP_IN`/`TCP_OUT`/`UDP_IN`/`UDP_OUT` (v4+v6 union — fwsec rules are family-agnostic), `csf.allow` → `fwsec.allow`, `csf.deny` → `fwsec.deny` (comments preserved) |
+| **UFW** | ALLOW IN ports → inbound lists |
+| **firewalld** | zone ports + common services (ssh, http, https, smtp, dns, …) → inbound lists |
+
+At the end of the installation a **migration report** lists everything
+inherited and everything intentionally not inherited (CSF country ipsets —
+use `GEO_BLOCK` + `fwsec --geo-update`, ICMP rate limits, NAT/rich rules).
+Interactive installs ask before migrating; non-interactive installs
+(`curl … | sudo bash`) migrate automatically.
+
 ## Quick reference
 
 ### Firewall lifecycle
