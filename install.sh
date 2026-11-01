@@ -155,8 +155,12 @@ detect_os() {
     case "$OS_FAMILY" in
         debian)
             case "$OS_ID" in
-                ubuntu|pop|linuxmint)
-                    _version_ge "$OS_VERSION" "22.04" || die "Ubuntu-family ${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 22.04 (EOL releases are out of scope)."
+                ubuntu)
+                    _version_ge "$OS_VERSION" "22.04" || die "Ubuntu ${OS_VERSION} is not supported. Minimum version: 22.04 (EOL releases are out of scope)."
+                    ;;
+                pop|linuxmint)
+                    # Derivatives use their own version numbering — warn, don't die
+                    _version_ge "$OS_VERSION" "22" || warn "Linux Mint/Pop!_OS ${OS_VERSION} is untested; continuing."
                     ;;
                 debian)
                     _version_ge "$OS_VERSION" "12" || die "Debian ${OS_VERSION} is not supported. Minimum version: 12 (EOL releases are out of scope)."
@@ -1166,7 +1170,7 @@ detect_container_runtimes() {
 
 _list_published_ports() {
     # Prints "HOSTPORT/PROTO -> container:port [runtime]" for running containers
-    local rt line
+    local rt
     for rt in $CONTAINER_RUNTIMES; do
         "$rt" ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | while IFS=$'\t' read -r name ports; do
             grep -oE '[^ ,]*:[0-9]+->[0-9]+/(tcp|udp)' <<< "$ports" | \
