@@ -4,7 +4,25 @@
 
 fwsec is distributed and maintained as an independent project. This repository contains all source code, configuration templates, and installation resources required to use it.
 
-> Supported systems: Ubuntu 24+ · Rocky Linux 8 / 9 / 10
+> Supported systems: Debian 12+ · Ubuntu 22.04+ · RHEL-family 8+ (Rocky, Alma, RHEL, CentOS Stream, Oracle Linux, Fedora 40+, Amazon Linux 2023) · openSUSE Leap 15.4+ / SLES 15 SP4+ · Arch · Alpine 3.17+
+
+## Supported distributions
+
+| Family | Distributions | Package manager | Init |
+|---|---|---|---|
+| Debian | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS, Devuan, Kali, Raspbian | apt | systemd |
+| RHEL | Rocky 8+, Alma 8+, RHEL 8+, CentOS Stream 9+, Oracle Linux 8+, Fedora 40+, Amazon Linux 2023 | dnf / yum | systemd |
+| SUSE | openSUSE Leap 15.4+, Tumbleweed, SLES 15 SP4+ | zypper | systemd |
+| Arch | Arch, Manjaro, EndeavourOS | pacman | systemd |
+| Alpine | 3.17+ (musl) | apk | OpenRC |
+
+Requirements on every distribution: **nftables ≥ 0.9.0** (kernel ≥ 4.18 — the floor of RHEL 8 / Debian 10 / Ubuntu 18.04) and **Python 3.8+**. When the distribution's Python is older than 3.8 (e.g. SLES 15), the installer provisions a standalone CPython through [uv](https://docs.astral.sh/uv/) instead — no manual step is needed. Boot persistence uses systemd, or OpenRC on Alpine; systems with neither are installed without the boot service (start fwsec manually).
+
+Notes:
+
+- Known derivatives of a supported family are allowed with a warning; EOL releases (Ubuntu ≤ 20.04, Debian ≤ 11, CentOS 7, Amazon Linux 2, Rocky/Alma/RHEL ≤ 7) are rejected.
+- Kernels without nf_tables support — **OpenVZ/Virtuozzo containers**, some stripped-down VPS kernels — cannot run fwsec; `fwsec -s` reports this explicitly instead of failing cryptically.
+- On Arch, CrowdSec is only available through the AUR; install it manually or run the installer with `--no-crowdsec`. fwsec works fully without it.
 
 ## Quick install
 
@@ -42,6 +60,7 @@ sudo bash install.sh
 | *(no flags)* | Installs fwsec. If it is already installed, displays its status and exits. |
 | `--upgrade` | Queries the GitHub repository for the latest version. When a newer release is available, downloads it and upgrades the package and executable while preserving configuration files; otherwise reports that fwsec is up to date. |
 | `--force` | Performs a complete reinstallation. |
+| `--no-crowdsec` | Installs fwsec without the CrowdSec integration (CrowdSec and its nftables bouncer can be added later; every fwsec command degrades gracefully when they are absent). |
 
 The installer also detects competing firewalls — **firewalld** and **UFW** on any supported distribution, plus legacy iptables rule-restore services (`iptables.service`, `netfilter-persistent`) — and stops, disables, and masks them, so nftables is managed exclusively by fwsec. The post-installation check fails loudly if either firewall is still active.
 
@@ -272,6 +291,8 @@ systemctl enable fwsec        # Enable at boot
 systemctl disable fwsec       # Disable at boot
 journalctl -u fwsec -f        # Follow logs
 ```
+
+On Alpine Linux the boot service is an OpenRC script instead: `rc-service fwsec start`, `rc-service fwsec stop`, `rc-update show default`.
 
 ## Practical examples
 
