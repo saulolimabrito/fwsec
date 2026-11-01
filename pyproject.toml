@@ -8,7 +8,7 @@ version = "1.1.0"
 description = "nftables + CrowdSec firewall manager — CSF-style CLI"
 readme = "README.md"
 license = "GPL-2.0-only"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 dependencies = []
 
 [project.urls]
@@ -25,11 +25,13 @@ packages = ["src/fwsec"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py38"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
 [tool.mypy]
-python_version = "3.10"
+# mypy no longer accepts 3.8 as a target; the runtime floor stays 3.8
+# (see [project] requires-python).
+python_version = "3.9"
 strict = true

@@ -2,16 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # =============================================================================
 # fwsec installer
-# Supported systems: Ubuntu 24+ | Rocky Linux 8 / 9 / 10
+# Supported systems: Debian 12+ | Ubuntu 22.04+ | RHEL-family 8+ (Rocky, Alma,
+# RHEL, CentOS Stream, Oracle, Fedora 40+, Amazon Linux 2023) | openSUSE Leap
+# 15.4+ / SLES 15+ | Arch | Alpine 3.17+ (OpenRC)
 # =============================================================================
 set -euo pipefail
 
-FWSEC_VERSION="1.1.0"
+FWSEC_VERSION="1.2.0"
 REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"
 BIN="/usr/local/bin/fwsec"
 SERVICE="/etc/systemd/system/fwsec.service"
+SERVICE_OPENRC="/etc/init.d/fwsec"
 # BASH_SOURCE is unset when the script is piped (curl | bash) — fall back to $0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
 
@@ -29,6 +32,31 @@ die()  { err "$*"; exit 1; }
 # Initial checks
 # =============================================================================
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo bash install.sh"
+
+# =============================================================================
+# Downloads with curl or wget (minimal distros ship only one of them)
+# =============================================================================
+fetch() {
+    # fetch URL [OUTPUT_FILE] [TIMEOUT_SECONDS]
+    # Downloads a URL with curl when available, wget otherwise.
+    # Without OUTPUT_FILE the body is written to stdout.
+    local url="$1" out="${2:-}" timeout="${3:-60}"
+    if command -v curl &>/dev/null; then
+        if [[ -n "$out" ]]; then
+            curl -fsSL --max-time "$timeout" -o "$out" "$url"
+        else
+            curl -fsSL --max-time "$timeout" "$url"
+        fi
+    elif command -v wget &>/dev/null; then
+        if [[ -n "$out" ]]; then
+            wget -q -T "$timeout" -O "$out" "$url"
+        else
+            wget -q -T "$timeout" -O- "$url"
+        fi
+    else
+        return 127
+    fi
+}
 
 # =============================================================================
 # Detect an existing installation
@@ -72,8 +100,21 @@ check_already_installed() {
 }
 
 # =============================================================================
-# Operating system detection
+# Operating system detection (family via ID + ID_LIKE)
 # =============================================================================
+_version_ge() {
+    # True when version $1 >= version $2 (dot-separated numeric comparison)
+    awk -v v="$1" -v f="$2" 'BEGIN {
+        split(v, a, "."); split(f, b, ".")
+        for (i = 1; i <= 3; i++) {
+            x = (i in a ? a[i] : 0); y = (i in b ? b[i] : 0)
+            if (x > y) exit 0
+            if (x < y) exit 1
+        }
+        exit 0
+    }'
+}
+
 detect_os() {
     [[ -f /etc/os-release ]] || die "/etc/os-release was not found."
     . /etc/os-release
@@ -81,26 +122,149 @@ detect_os() {
     OS_ID="${ID:-}"
     OS_VERSION="${VERSION_ID:-0}"
     OS_MAJOR=$(echo "$OS_VERSION" | cut -d. -f1)
+    OS_LIKE="${ID_LIKE:-}"
 
+    local _family=""
     case "$OS_ID" in
-        ubuntu)
-            [[ "$OS_MAJOR" -ge 24 ]] || die "Ubuntu ${OS_VERSION} is not supported. Minimum version: 24."
-            OS_FAMILY="debian"
-            ok "Detected Ubuntu ${OS_VERSION}."
-            ;;
-        rocky)
-            [[ "$OS_MAJOR" -ge 8 ]] || die "Rocky Linux ${OS_VERSION} is not supported. Minimum version: 8."
-            OS_FAMILY="rhel"
-            ok "Detected Rocky Linux ${OS_VERSION}."
-            ;;
-        rhel|almalinux|ol)
-            [[ "$OS_MAJOR" -ge 8 ]] || die "${PRETTY_NAME} is not supported. Minimum version: 8."
-            OS_FAMILY="rhel"
-            warn "Detected a Rocky-compatible distribution (${PRETTY_NAME}). Continuing..."
-            ;;
+        debian|ubuntu|linuxmint|raspbian|devuan|kali|pop)
+            _family="debian" ;;
+        rocky|almalinux|rhel|centos|ol|fedora|amzn|vzlinux|nobara)
+            _family="rhel" ;;
+        sles|sles_sap|opensuse-leap|opensuse-tumbleweed|opensuse)
+            _family="suse" ;;
+        arch|manjaro|endeavouros|garuda|artix)
+            _family="arch" ;;
+        alpine)
+            _family="alpine" ;;
         *)
-            die "Operating system '${OS_ID}' is not supported. Use Ubuntu 24+ or Rocky Linux 8+."
+            # Derivatives: fall back to ID_LIKE
+            case "$OS_LIKE" in
+                *debian*) _family="debian" ;;
+                *rhel*|*fedora*|*centos*) _family="rhel" ;;
+                *suse*|*sles*) _family="suse" ;;
+                *arch*) _family="arch" ;;
+                *alpine*) _family="alpine" ;;
+            esac
             ;;
+    esac
+    [[ -n "$_family" ]] || die "Operating system '${PRETTY_NAME:-$OS_ID}' is not supported."
+    OS_FAMILY="$_family"
+
+    # Version floors — EOL releases are out of scope. Unknown derivatives of a
+    # known family (own versioning scheme) are allowed with a warning.
+    case "$OS_FAMILY" in
+        debian)
+            case "$OS_ID" in
+                ubuntu|pop|linuxmint)
+                    _version_ge "$OS_VERSION" "22.04" || die "Ubuntu-family ${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 22.04 (EOL releases are out of scope)."
+                    ;;
+                debian)
+                    _version_ge "$OS_VERSION" "12" || die "Debian ${OS_VERSION} is not supported. Minimum version: 12 (EOL releases are out of scope)."
+                    ;;
+                *)
+                    warn "Detected a Debian derivative (${PRETTY_NAME:-$OS_ID} ${OS_VERSION}); continuing untested."
+                    ;;
+            esac
+            ok "Detected ${PRETTY_NAME:-$OS_ID} (debian family)."
+            ;;
+        rhel)
+            if [[ "$OS_ID" == "amzn" ]]; then
+                [[ "$OS_VERSION" == "2023" ]] || die "Amazon Linux ${OS_VERSION} is not supported (Amazon Linux 2 is EOL). Use Amazon Linux 2023."
+            elif [[ "$OS_ID" == "centos" ]]; then
+                [[ "$OS_MAJOR" -ge 9 ]] || die "CentOS ${OS_VERSION} is not supported. Use CentOS Stream 9/10 (CentOS 7 is EOL)."
+            elif [[ "$OS_ID" == "fedora" ]]; then
+                _version_ge "$OS_VERSION" "40" || die "Fedora ${OS_VERSION} is not supported. Minimum version: 40."
+            else
+                _version_ge "$OS_VERSION" "8" || die "${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 8."
+            fi
+            ok "Detected ${PRETTY_NAME:-$OS_ID} (rhel family)."
+            ;;
+        suse)
+            _version_ge "$OS_VERSION" "15.4" || die "${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 15.4."
+            ok "Detected ${PRETTY_NAME:-$OS_ID} (suse family)."
+            ;;
+        arch)
+            ok "Detected ${PRETTY_NAME:-$OS_ID} (arch family, rolling release)."
+            ;;
+        alpine)
+            _version_ge "$OS_VERSION" "3.17" || die "Alpine ${OS_VERSION} is not supported. Minimum version: 3.17."
+            ok "Detected Alpine ${OS_VERSION}."
+            ;;
+    esac
+
+    detect_pkg
+}
+
+# =============================================================================
+# Package manager abstraction (apt | dnf | zypper | pacman | apk)
+# =============================================================================
+detect_pkg() {
+    case "$OS_FAMILY" in
+        debian) PKG="apt" ;;
+        rhel)   PKG="dnf" ;;
+        suse)   PKG="zypper" ;;
+        arch)   PKG="pacman" ;;
+        alpine) PKG="apk" ;;
+        *)      PKG="" ;;
+    esac
+}
+
+pkg_refresh() {
+    case "$PKG" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || \
+                warn "apt-get update reported errors from an unrelated repository; continuing." ;;
+        zypper) zypper --non-interactive --quiet refresh 2>/dev/null || true ;;
+        *)      true ;;  # dnf/pacman/apk refresh metadata automatically
+    esac
+}
+
+pkg_install() {
+    case "$PKG" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>/dev/null ;;
+        dnf)    dnf install -y -q "$@" 2>/dev/null || \
+                yum install -y -q "$@" 2>/dev/null || \
+                microdnf install -q "$@" 2>/dev/null ;;
+        zypper) zypper --quiet --non-interactive install "$@" 2>/dev/null ;;
+        pacman) pacman -S --noconfirm --needed "$@" 2>/dev/null ;;
+        apk)    apk add --no-cache --quiet "$@" 2>/dev/null ;;
+        *)      return 1 ;;
+    esac
+}
+
+# =============================================================================
+# Init system abstraction (systemd | OpenRC | none)
+# =============================================================================
+detect_init() {
+    if command -v systemctl &>/dev/null; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service &>/dev/null; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="none"
+    fi
+}
+
+svc_enable() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl enable "$@" 2>/dev/null || true ;;
+        openrc)  local s; for s in "$@"; do rc-update add "$s" default 2>/dev/null || true; done ;;
+        *)       true ;;
+    esac
+}
+
+svc_start() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl start "$@" 2>/dev/null || true ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" start 2>/dev/null || true; done ;;
+        *)       true ;;
+    esac
+}
+
+svc_restart() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl restart "$@" 2>/dev/null || true ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" restart 2>/dev/null || true; done ;;
+        *)       true ;;
     esac
 }
 
@@ -108,90 +272,89 @@ detect_os() {
 # Base dependency installation
 # =============================================================================
 install_base_deps() {
-    info "Installing base dependencies..."
+    info "Installing base dependencies (${PKG})..."
+    pkg_refresh
     case "$OS_FAMILY" in
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            # A broken unrelated third-party repo must not abort the install
-            apt-get update -qq 2>/dev/null || warn "apt-get update reported errors from an unrelated repository; continuing."
-            apt-get install -y -qq \
-                curl tar gzip ca-certificates gnupg \
-                nftables \
-                python3 python3-pip \
-                2>/dev/null
-            ;;
-        rhel)
-            dnf install -y -q \
-                curl tar gzip ca-certificates \
-                nftables \
-                2>/dev/null
-            ;;
+        debian) pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
+        rhel)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute python3 || true ;;
+        suse)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
+        arch)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python || true ;;
+        alpine) pkg_install bash curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
     esac
+    command -v nft &>/dev/null || die "nftables could not be installed ('nft' binary missing)."
+    command -v tar &>/dev/null || die "tar could not be installed."
     ok "Base dependencies installed."
 }
 
 # =============================================================================
-# Python 3.11+
+# Python 3.8+ (distro Python when possible; uv-managed standalone as fallback)
 # =============================================================================
-install_python() {
-    info "Checking for Python 3.11+..."
+python_ok() {
+    # True when $1 is a Python interpreter with version >= 3.8
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
+}
 
-    # Find an installed Python version >= 3.11
-    PYTHON=""
-    for py in python3.13 python3.12 python3.11; do
-        if command -v "$py" &>/dev/null; then
+find_python() {
+    local py
+    for py in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+        if command -v "$py" &>/dev/null && python_ok "$(command -v "$py")"; then
             PYTHON=$(command -v "$py")
-            break
+            return 0
         fi
     done
+    return 1
+}
 
-    if [[ -n "$PYTHON" ]]; then
-        PY_VER=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-        ok "Found Python ${PY_VER} at ${PYTHON}."
+_python_found() {
+    PY_VER=$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+    ok "Found Python ${PY_VER} at ${PYTHON}."
+}
+
+install_python() {
+    info "Looking for Python 3.8+..."
+
+    PYTHON=""
+    if find_python; then
+        _python_found
         return
     fi
 
-    info "Python 3.11+ was not found. Installing it..."
+    info "No Python 3.8+ found. Installing a newer Python from the distribution..."
     case "$OS_FAMILY" in
         debian)
-            # Ubuntu 24 provides Python 3.12 through apt
-            apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null || \
-            apt-get install -y -qq python3.11 python3.11-venv 2>/dev/null || \
-            die "Could not install Python 3.11+."
+            pkg_install python3.12 python3.12-venv || \
+            pkg_install python3.11 python3.11-venv || \
+            true
             ;;
         rhel)
-            case "$OS_MAJOR" in
-                8)
-                    # Rocky 8 provides Python 3.11 through AppStream
-                    dnf module reset python39 -y -q 2>/dev/null || true
-                    dnf install -y -q python3.11 python3.11-pip 2>/dev/null || {
-                        # Fallback: EPEL
-                        dnf install -y -q epel-release 2>/dev/null || true
-                        dnf install -y -q python3.11 2>/dev/null || \
-                        die "Could not install Python 3.11 on Rocky Linux 8."
-                    }
-                    ;;
-                9|10)
-                    # Rocky 9/10 provide Python 3.11 through AppStream
-                    dnf install -y -q python3.11 python3.11-pip 2>/dev/null || \
-                    dnf install -y -q python3.12 python3.12-pip 2>/dev/null || \
-                    die "Could not install Python 3.11+ on Rocky Linux ${OS_MAJOR}."
-                    ;;
-            esac
+            if [[ "$OS_MAJOR" == "8" ]]; then
+                # Rocky/RHEL 8 provide Python 3.11 through AppStream
+                pkg_install python3.11 python3.11-pip || {
+                    pkg_install epel-release || true
+                    pkg_install python3.11 || true
+                }
+            else
+                pkg_install python3.11 python3.11-pip || \
+                pkg_install python3.12 python3.12-pip || \
+                pkg_install python3.13 python3.13-pip || \
+                true
+            fi
             ;;
+        suse)   pkg_install python311 || pkg_install python312 || true ;;
+        arch)   pkg_install python || true ;;
+        alpine) pkg_install python3 || true ;;
     esac
 
-    # Detect Python again after installation
-    for py in python3.13 python3.12 python3.11; do
-        if command -v "$py" &>/dev/null; then
-            PYTHON=$(command -v "$py")
-            break
-        fi
-    done
-    [[ -n "$PYTHON" ]] || die "Python 3.11+ was not found after installation."
+    if find_python; then
+        _python_found
+        return
+    fi
 
-    PY_VER=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    ok "Installed Python ${PY_VER} at ${PYTHON}."
+    # Last resort: uv provisions a standalone CPython 3.11 (glibc or musl) on
+    # its own — see install_fwsec_package(). This keeps the installer working
+    # on distributions whose native Python is older than the floor (e.g. SLES).
+    warn "No distro Python 3.8+ available. uv will provision a standalone Python 3.11."
+    PYTHON=""
 }
 
 # =============================================================================
@@ -203,64 +366,100 @@ install_uv() {
         return
     fi
 
-    info "Installing uv..."
+    # Distribution packages when available (Arch extra, Alpine community)
+    pkg_install uv || true
+    if command -v uv &>/dev/null; then
+        ok "Installed uv: $(uv --version)."
+        return
+    fi
 
-    # Ensure tar is available; minimal containers may omit it
-    case "$OS_FAMILY" in
-        debian) command -v tar &>/dev/null || apt-get install -y -qq tar ;;
-        rhel)   command -v tar &>/dev/null || dnf install -y -q tar ;;
-    esac
-
-    curl -fsSL https://astral.sh/uv/install.sh | env HOME=/root sh >/dev/null 2>&1
-    export PATH="/root/.local/bin:$PATH"
+    info "Installing uv (standalone installer)..."
+    fetch "https://astral.sh/uv/install.sh" | env HOME=/root sh >/dev/null 2>&1 || true
+    export PATH="/root/.local/bin:${HOME}/.local/bin:$PATH"
 
     command -v uv &>/dev/null || die "uv was not found after installation."
     ok "Installed uv: $(uv --version)."
 }
 
 # =============================================================================
-# CrowdSec
+# CrowdSec (optional: --no-crowdsec skips it; failures never abort the install)
 # =============================================================================
 install_crowdsec() {
+    if [[ "$NO_CROWDSEC" -eq 1 ]]; then
+        warn "CrowdSec integration disabled (--no-crowdsec)."
+        return 0
+    fi
+
+    local have_crowdsec=0 have_bouncer=0
+
     if command -v crowdsec &>/dev/null; then
         ok "CrowdSec is already installed."
+        have_crowdsec=1
     else
         info "Installing CrowdSec..."
         case "$OS_FAMILY" in
             debian)
-                curl -fsSL https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash >/dev/null 2>&1
-                apt-get install -y -qq crowdsec
+                if fetch "https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh" | bash >/dev/null 2>&1; then
+                    pkg_install crowdsec && have_crowdsec=1
+                fi
                 ;;
-            rhel)
-                curl -fsSL https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.rpm.sh | bash >/dev/null 2>&1
-                dnf install -y -q crowdsec
+            rhel|suse)
+                if fetch "https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.rpm.sh" | bash >/dev/null 2>&1; then
+                    pkg_install crowdsec && have_crowdsec=1
+                fi
+                ;;
+            alpine)
+                if pkg_install crowdsec; then
+                    have_crowdsec=1
+                fi
+                ;;
+            arch)
+                warn "CrowdSec on Arch is available only through the AUR. Install it manually later (e.g. yay -S crowdsec crowdsec-firewall-bouncer-nftables)."
                 ;;
         esac
-        ok "CrowdSec installed."
+        if [[ "$have_crowdsec" -eq 1 ]]; then
+            ok "CrowdSec installed."
+        else
+            warn "CrowdSec was not installed automatically. fwsec works fully without it; you can add it later."
+        fi
     fi
 
     if command -v crowdsec-firewall-bouncer &>/dev/null || \
        [[ -f /usr/bin/crowdsec-firewall-bouncer ]]; then
         ok "The CrowdSec firewall bouncer is already installed."
-    else
+        have_bouncer=1
+    elif [[ "$have_crowdsec" -eq 1 ]]; then
         info "Installing the CrowdSec nftables bouncer..."
         case "$OS_FAMILY" in
-            debian) apt-get install -y -qq crowdsec-firewall-bouncer-nftables ;;
-            rhel)   dnf install -y -q crowdsec-firewall-bouncer-nftables ;;
+            debian|rhel|suse)
+                if pkg_install crowdsec-firewall-bouncer-nftables; then
+                    have_bouncer=1
+                fi
+                ;;
+            alpine)
+                if pkg_install crowdsec-firewall-bouncer-nftables || pkg_install crowdsec-firewall-bouncer; then
+                    have_bouncer=1
+                fi
+                ;;
         esac
-        ok "CrowdSec nftables bouncer installed."
+        if [[ "$have_bouncer" -eq 1 ]]; then
+            ok "CrowdSec nftables bouncer installed."
+        else
+            warn "The nftables bouncer was not installed automatically; CrowdSec bans will not reach nftables until it is."
+        fi
     fi
 
-    # Enable and start CrowdSec
-    systemctl enable crowdsec --now 2>/dev/null || true
+    if [[ "$have_crowdsec" -eq 1 ]]; then
+        svc_enable crowdsec
+        svc_start crowdsec
+    fi
 
-    # Configure the bouncer if it is not running
     _configure_crowdsec_bouncer
 }
 
 _configure_crowdsec_bouncer() {
     local bouncer_conf="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
-    [[ -f "$bouncer_conf" ]] || { warn "Bouncer configuration was not found."; return; }
+    [[ -f "$bouncer_conf" ]] || { warn "Bouncer configuration was not found."; return 0; }
 
     # Generate a key only when the bouncer does not have a valid one
     if grep -qE '^api_key:\s*$' "$bouncer_conf" 2>/dev/null || \
@@ -306,13 +505,13 @@ nftables:
 BCEOF
     fi
 
-    systemctl enable crowdsec-firewall-bouncer --now 2>/dev/null || \
-    systemctl restart crowdsec-firewall-bouncer 2>/dev/null || true
+    svc_enable crowdsec-firewall-bouncer
+    svc_restart crowdsec-firewall-bouncer
     ok "CrowdSec bouncer configured."
 }
 
 # =============================================================================
-# SELinux (Rocky 8/9/10)
+# SELinux (RHEL family)
 # =============================================================================
 configure_selinux() {
     [[ "$OS_FAMILY" == "rhel" ]] || return 0
@@ -322,26 +521,24 @@ configure_selinux() {
     info "Configuring SELinux for nftables and Python..."
 
     if ! command -v semanage &>/dev/null; then
-        dnf install -y -q policycoreutils-python-utils 2>/dev/null || true
+        pkg_install policycoreutils-python-utils || true
     fi
 
-    # Detect the configured SSH port
+    # Register every effective SSH port (sshd may listen on several)
     local ssh_port
-    ssh_port=$(grep -E "^Port\s+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1 || echo "22")
-
-    if [[ "$ssh_port" != "22" ]]; then
+    while read -r ssh_port; do
+        [[ -n "$ssh_port" && "$ssh_port" != "22" ]] || continue
         semanage port -a -t ssh_port_t -p tcp "$ssh_port" 2>/dev/null || \
         semanage port -m -t ssh_port_t -p tcp "$ssh_port" 2>/dev/null || true
-    fi
+    done < <(_detect_ssh_ports_bash)
 
     ok "SELinux configured."
 }
 
 # =============================================================================
-# AppArmor (Ubuntu)
+# AppArmor (Debian/Ubuntu/SUSE)
 # =============================================================================
 configure_apparmor() {
-    [[ "$OS_FAMILY" == "debian" ]] || return 0
     command -v aa-status &>/dev/null || return 0
     aa-status --enabled 2>/dev/null || return 0
 
@@ -359,6 +556,11 @@ configure_apparmor() {
 # Disable competing firewalls
 # =============================================================================
 disable_competing_firewalls() {
+    if [[ "$INIT_SYSTEM" != "systemd" ]]; then
+        info "Init system is not systemd: no competing firewall services to disable."
+        return 0
+    fi
+
     info "Checking for competing firewalls (nftables must be managed only by fwsec)..."
 
     # firewalld — checked on every distro, not only RHEL-family
@@ -387,13 +589,14 @@ disable_competing_firewalls() {
         ok "UFW is not installed."
     fi
 
-    # Legacy iptables rule restorers — they would fight fwsec's ruleset at boot
+    # Legacy iptables rule restorers and SuSEfirewall2 — they would fight
+    # fwsec's ruleset at boot
     local svc
-    for svc in iptables ip6tables netfilter-persistent; do
+    for svc in iptables ip6tables netfilter-persistent SuSEfirewall2; do
         if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
             systemctl stop "$svc" 2>/dev/null || true
             systemctl disable "$svc" 2>/dev/null || true
-            warn "${svc}.service disabled (it restored iptables rules at boot)."
+            warn "${svc}.service disabled (it restored firewall rules at boot)."
         fi
     done
 
@@ -405,10 +608,16 @@ disable_competing_firewalls() {
 # =============================================================================
 install_fwsec_package() {
     info "Creating a virtual environment at ${INSTALL_DIR}..."
-    export PATH="/root/.local/bin:$PATH"
+    export PATH="/root/.local/bin:${HOME}/.local/bin:$PATH"
 
     rm -rf "${INSTALL_DIR}/venv"
-    uv venv "${INSTALL_DIR}/venv" --python "$PYTHON" --quiet
+    if [[ -n "$PYTHON" ]]; then
+        uv venv "${INSTALL_DIR}/venv" --python "$PYTHON" --quiet
+    else
+        # uv downloads a standalone CPython (glibc or musl) when no system
+        # Python satisfies the floor — works on any distribution.
+        uv venv "${INSTALL_DIR}/venv" --python 3.11 --quiet
+    fi
 
     info "Installing fwsec ${FWSEC_VERSION}..."
     uv pip install --quiet "${SCRIPT_DIR}" \
@@ -459,9 +668,19 @@ WRAPPER
 }
 
 # =============================================================================
-# systemd service
+# Boot service (systemd unit | OpenRC script)
 # =============================================================================
 install_service() {
+    case "$INIT_SYSTEM" in
+        systemd) _install_service_systemd ;;
+        openrc)  _install_service_openrc ;;
+        *)       warn "No systemd or OpenRC detected: skipping the boot service."
+                 warn "Start fwsec manually after boot: fwsec -s"
+                 return 0 ;;
+    esac
+}
+
+_install_service_systemd() {
     info "Installing the fwsec.service systemd unit..."
     cat > "$SERVICE" << UNIT
 [Unit]
@@ -482,16 +701,51 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-    systemctl daemon-reload
-    systemctl enable fwsec.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable fwsec.service 2>/dev/null || true
     ok "fwsec.service installed and enabled at boot."
+}
+
+_install_service_openrc() {
+    info "Installing the fwsec OpenRC service..."
+    cat > "$SERVICE_OPENRC" << UNIT
+#!/sbin/openrc-run
+
+description="fwsec - nftables + CrowdSec firewall manager"
+
+command="${BIN}"
+
+depend() {
+    need net
+    after nftables crowdsec
+}
+
+start() {
+    ebegin "Starting fwsec firewall"
+    "${BIN}" -s
+    eend \$?
+}
+
+stop() {
+    ebegin "Stopping fwsec firewall"
+    "${BIN}" -f
+    eend \$?
+}
+UNIT
+    chmod +x "$SERVICE_OPENRC"
+    rc-update add fwsec default 2>/dev/null || true
+    ok "OpenRC service installed and added to the default runlevel."
 }
 
 # =============================================================================
 # Ensure the nftables service is enabled at boot
 # =============================================================================
 enable_nftables() {
-    systemctl enable nftables 2>/dev/null || true
+    case "$INIT_SYSTEM" in
+        systemd) systemctl enable nftables 2>/dev/null || true ;;
+        openrc)  rc-update add nftables boot 2>/dev/null || true ;;
+        *)       return 0 ;;
+    esac
     ok "nftables enabled at boot."
 }
 
@@ -507,9 +761,28 @@ post_install_check() {
     command -v nft &>/dev/null            && ok "  nft: OK" || { warn "  nft: not found"; }
     command -v crowdsec &>/dev/null       && ok "  crowdsec: OK" || { warn "  crowdsec: not found"; }
     command -v cscli &>/dev/null          && ok "  cscli: OK" || { warn "  cscli: not found"; }
-    systemctl is-enabled fwsec &>/dev/null && ok "  fwsec.service: enabled" || { warn "  fwsec.service: not enabled"; }
 
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
+    case "$INIT_SYSTEM" in
+        systemd)
+            if systemctl is-enabled fwsec &>/dev/null; then
+                ok "  fwsec.service: enabled"
+            else
+                warn "  fwsec.service: not enabled"
+            fi
+            ;;
+        openrc)
+            if rc-update show default 2>/dev/null | grep -q fwsec; then
+                ok "  fwsec (OpenRC): added to the default runlevel"
+            else
+                warn "  fwsec (OpenRC): not in the default runlevel"
+            fi
+            ;;
+        *)
+            warn "  boot service: not installed (no systemd/OpenRC)"
+            ;;
+    esac
+
+    if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet firewalld 2>/dev/null; then
         err "  firewalld: STILL ACTIVE (conflicts with fwsec)"; ((issues++))
     else
         ok "  firewalld: inactive"
@@ -534,12 +807,12 @@ version_gt() {
 fetch_remote_version() {
     local v=""
     # Prefer the latest published release tag
-    v=$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    v=$(fetch "https://api.github.com/repos/${REPO}/releases/latest" "" 15 2>/dev/null \
         | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -1 \
         | sed -E 's/.*"v?([0-9][^"]*)"$/\1/') || true
     # Fallback: version declared in pyproject.toml on main
     if [[ -z "$v" ]]; then
-        v=$(curl -fsSL --max-time 15 "https://raw.githubusercontent.com/${REPO}/main/pyproject.toml" 2>/dev/null \
+        v=$(fetch "https://raw.githubusercontent.com/${REPO}/main/pyproject.toml" "" 15 2>/dev/null \
             | grep -E '^version[[:space:]]*=' | head -1 \
             | sed -E 's/.*"([^"]+)".*/\1/') || true
     fi
@@ -550,11 +823,11 @@ download_source() {
     # Downloads and extracts the source for version $1; echoes the source dir.
     local ver="$1" tmp dir
     tmp=$(mktemp -d /tmp/fwsec-upgrade.XXXXXX)
-    if ! curl -fsSL --max-time 60 -o "${tmp}/src.tar.gz" \
-            "https://github.com/${REPO}/archive/refs/tags/v${ver}.tar.gz" 2>/dev/null; then
+    if ! fetch "https://github.com/${REPO}/archive/refs/tags/v${ver}.tar.gz" \
+            "${tmp}/src.tar.gz" 60 2>/dev/null; then
         # No tag for this version — fall back to the main branch tarball
-        curl -fsSL --max-time 60 -o "${tmp}/src.tar.gz" \
-            "https://github.com/${REPO}/archive/refs/heads/main.tar.gz" \
+        fetch "https://github.com/${REPO}/archive/refs/heads/main.tar.gz" \
+            "${tmp}/src.tar.gz" 60 \
             || { rm -rf "$tmp"; return 1; }
     fi
     tar -xzf "${tmp}/src.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
@@ -571,7 +844,8 @@ bootstrap_source() {
     fi
 
     info "Standalone mode: downloading the fwsec source (no git required)..."
-    command -v curl &>/dev/null || die "curl is required for the standalone install."
+    command -v curl &>/dev/null || command -v wget &>/dev/null || \
+        die "curl or wget is required for the standalone install."
     command -v tar  &>/dev/null || die "tar is required for the standalone install."
 
     local ver src_dir
@@ -584,7 +858,8 @@ bootstrap_source() {
 }
 
 run_upgrade() {
-    command -v curl &>/dev/null || die "curl is required for --upgrade."
+    command -v curl &>/dev/null || command -v wget &>/dev/null || \
+        die "curl or wget is required for --upgrade."
 
     local installed=""
     if command -v fwsec &>/dev/null; then
@@ -624,6 +899,32 @@ run_upgrade() {
     fwsec -v
     echo ""
     exit 0
+}
+
+# =============================================================================
+# Effective SSH ports (bash-side; mirrors fwsec's _detect_ssh_ports)
+# =============================================================================
+_detect_ssh_ports_bash() {
+    # Prints the effective SSH listening ports, one per line (default: 22).
+    # sshd -T reflects the effective configuration (main file + drop-ins);
+    # config parsing is the fallback. Opening a superset is always safe —
+    # missing a port locks you out of the server.
+    local sshd_bin ports=""
+
+    sshd_bin=$(command -v sshd || echo /usr/sbin/sshd)
+    if [[ -x "$sshd_bin" ]]; then
+        ports=$("$sshd_bin" -T 2>/dev/null | awk '/^port /{print $2}' || true)
+    fi
+
+    if [[ -z "$ports" ]]; then
+        ports=$({ grep -hE '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null || true; \
+                  grep -hE '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true; } \
+                | awk '{print $2}' || true)
+    fi
+
+    ports=$(printf '%s\n' $ports | sort -un | grep -v '^$' || true)
+    [[ -n "$ports" ]] || ports="22"
+    echo "$ports"
 }
 
 # =============================================================================
@@ -702,17 +1003,47 @@ DEFAULT_TCP_OUT="80,443,53,853"   # HTTP, HTTPS, DNS, DNS-over-TLS
 DEFAULT_UDP_OUT="53,123,443"      # DNS, NTP, QUIC/HTTP3
 
 _list_listeners() {
-    # $1 = t|u — prints "port service" pairs, skipping loopback-only listeners
-    ss -H "-${1}lnp" 2>/dev/null | awk '
-    {
-        n = split($4, a, ":"); port = a[n]
-        addr = substr($4, 1, length($4) - length(port) - 1)
-        if (addr ~ /^127\./ || addr == "[::1]") next
-        if (port !~ /^[0-9]+$/) next
-        svc = "-"
-        if (match($0, /\(\("[^"]+"/)) svc = substr($0, RSTART + 3, RLENGTH - 4)
-        if (!seen[port]++) print port, svc
-    }' | sort -n
+    # $1 = t|u — prints "port service" pairs, skipping loopback-only listeners.
+    # Uses ss (iproute2); falls back to netstat (busybox/bsd variant) when ss
+    # is unavailable or produces no output.
+    local out=""
+    if command -v ss &>/dev/null; then
+        out=$(ss -H "-${1}lnp" 2>/dev/null | awk '
+        {
+            n = split($4, a, ":"); port = a[n]
+            addr = substr($4, 1, length($4) - length(port) - 1)
+            if (addr ~ /^127\./ || addr == "[::1]") next
+            if (port !~ /^[0-9]+$/) next
+            svc = "-"
+            if (match($0, /\(\("[^"]+"/)) svc = substr($0, RSTART + 3, RLENGTH - 4)
+            if (!seen[port]++) print port, svc
+        }' | sort -n || true)
+    fi
+    if [[ -z "$out" ]] && command -v netstat &>/dev/null; then
+        if [[ "$1" == "t" ]]; then
+            out=$(netstat -tln 2>/dev/null | awk '
+            $1 ~ /^tcp/ && $6 == "LISTEN" {
+                n = split($4, a, ":"); port = a[n]
+                addr = substr($4, 1, length($4) - length(port) - 1)
+                if (addr ~ /^127\./ || addr == "[::1]") next
+                if (port !~ /^[0-9]+$/) next
+                if (!seen[port]++) print port, "-"
+            }' | sort -n || true)
+        else
+            out=$(netstat -uln 2>/dev/null | awk '
+            $1 ~ /^udp/ {
+                n = split($4, a, ":"); port = a[n]
+                addr = substr($4, 1, length($4) - length(port) - 1)
+                if (addr ~ /^127\./ || addr == "[::1]") next
+                if (port !~ /^[0-9]+$/) next
+                if (!seen[port]++) print port, "-"
+            }' | sort -n || true)
+        fi
+    fi
+    if [[ -z "$out" ]]; then
+        warn "Could not list listening ports (ss/netstat unavailable or empty)."
+    fi
+    printf '%s\n' "$out"
 }
 
 set_conf_value() {
@@ -751,10 +1082,9 @@ configure_ports() {
         fi
     fi
 
-    local ssh_port
-    # `|| true`: sshd_config without an explicit Port line must not abort (set -e + pipefail)
-    ssh_port=$(grep -E "^Port\s+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1 || true)
-    ssh_port="${ssh_port:-22}"
+    local ssh_ports ssh_port
+    ssh_ports=$(_detect_ssh_ports_bash | tr '\n' ',' | sed -E 's/,$//' || true)
+    ssh_port="${ssh_ports%%,*}"
 
     echo ""
     echo -e "${BOLD}${CYAN}--------------------------------------------${NC}"
@@ -771,7 +1101,7 @@ configure_ports() {
     local port svc
     while read -r port svc; do
         [[ -n "$port" ]] || continue
-        if [[ "$port" == "$ssh_port" ]]; then
+        if [[ " ${ssh_ports//,/ } " == *" $port "* ]]; then
             printf "    %-8s %-6s %s  ${GREEN}(SSH — always kept open)${NC}\n" "$port" "tcp" "$svc"
         else
             printf "    %-8s %-6s %s\n" "$port" "tcp" "$svc"
@@ -784,7 +1114,10 @@ configure_ports() {
 
     # Suggested inbound defaults = detected listeners (SSH is handled separately)
     local tcp_in_default udp_in_default
-    tcp_in_default=$(awk -v ssh="$ssh_port" '$1 != ssh {printf "%s%s", sep, $1; sep=","}' <<< "$tcp_listeners")
+    tcp_in_default=$(awk -v ssh_ports="$ssh_ports" '
+        BEGIN { n = split(ssh_ports, p, ","); for (i = 1; i <= n; i++) if (p[i] != "") skip[p[i]] = 1 }
+        !($1 in skip) { printf "%s%s", sep, $1; sep = "," }
+    ' <<< "$tcp_listeners")
     udp_in_default=$(awk '{printf "%s%s", sep, $1; sep=","}' <<< "$udp_listeners")
 
     local tcp_in udp_in tcp_out udp_out
@@ -792,7 +1125,7 @@ configure_ports() {
         echo ""
         info "Choose which ports stay open. Press Enter to accept the suggested value,"
         info "type a comma-separated list (ranges like 8000:8080 allowed), or 'none'."
-        info "The SSH port (${ssh_port}) is detected automatically and always stays open."
+        info "SSH port(s) (${ssh_ports}) are detected automatically and always stay open."
         echo ""
         tcp_in=$(_prompt_ports  "Inbound  TCP (TCP_IN)  — detected services" "$tcp_in_default")
         udp_in=$(_prompt_ports  "Inbound  UDP (UDP_IN)  — detected services" "$udp_in_default")
@@ -997,7 +1330,7 @@ configure_crowdsec_container_logs() {
 source: docker
 use_container_labels: true
 ACQEOF
-    systemctl restart crowdsec 2>/dev/null || true
+    svc_restart crowdsec
     ok "CrowdSec container log acquisition enabled (${acquis})."
     info "Label your containers (e.g. crowdsec.labels.type=nginx) so CrowdSec"
     info "parses their logs with the right scenario collection."
@@ -1024,11 +1357,13 @@ main() {
     # Parse flags
     FORCE=0
     UPGRADE=0
+    NO_CROWDSEC=0
     CONF_IS_NEW=0
     for arg in "$@"; do
         case "$arg" in
-            --force)   FORCE=1 ;;
-            --upgrade) UPGRADE=1 ;;
+            --force)       FORCE=1 ;;
+            --upgrade)     UPGRADE=1 ;;
+            --no-crowdsec) NO_CROWDSEC=1 ;;
         esac
     done
 
@@ -1052,6 +1387,8 @@ main() {
     fi
 
     detect_os
+    detect_init
+    ok "Init system: ${INIT_SYSTEM}."
 
     # Upgrade: consult the repository and install a newer release when available.
     # Only the package and executable change; configuration is preserved.
@@ -1087,8 +1424,8 @@ main() {
     info "Running the post-installation check..."
     post_install_check || true
 
-    local ssh_port
-    ssh_port=$(grep -E "^Port\s+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1 || echo "22")
+    local ssh_ports
+    ssh_ports=$(_detect_ssh_ports_bash | tr '\n' ',' | sed -E 's/,$//' || true)
 
     echo ""
     echo -e "${BOLD}${GREEN}============================================${NC}"
@@ -1096,7 +1433,7 @@ main() {
     echo -e "${BOLD}${GREEN}============================================${NC}"
     echo -e "  Config dir  : ${CONFIG_DIR}/"
     echo -e "  Executable  : ${BIN}"
-    echo -e "  SSH port    : ${ssh_port}"
+    echo -e "  SSH port(s) : ${ssh_ports:-22}"
     echo ""
     echo -e "  ${BOLD}Useful commands:${NC}"
     echo -e "    fwsec -s              Start the firewall"
