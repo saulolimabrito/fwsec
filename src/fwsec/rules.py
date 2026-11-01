@@ -17,11 +17,17 @@ from fwsec.config import FwsecConfig
 FILTER_TABLE = "inet filter"
 
 
-def generate_filter_table(cfg: FwsecConfig, ssh_port: int) -> str:
-    """Generate the complete `inet filter` nftables config."""
+def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
+    """Generate the complete `inet filter` nftables config.
 
-    # Remove SSH port from tcp_in to avoid duplicate rule
-    tcp_in_no_ssh = [p for p in cfg.tcp_in if p != str(ssh_port)]
+    `ssh_ports` is the list of effective SSH listening ports — sshd may
+    listen on several at once (main config + sshd_config.d drop-ins), and
+    every one of them must stay open or you get locked out of the server.
+    """
+
+    # Remove SSH ports from tcp_in to avoid duplicate rules
+    ssh_set = {str(p) for p in ssh_ports}
+    tcp_in_no_ssh = [p for p in cfg.tcp_in if p not in ssh_set]
     tcp_in_ports = _port_list(tcp_in_no_ssh)
     tcp_out_ports = _port_list(cfg.tcp_out)
     udp_in_ports = _port_list(cfg.udp_in)
@@ -37,6 +43,11 @@ def generate_filter_table(cfg: FwsecConfig, ssh_port: int) -> str:
     tcp_out_rule = f"tcp dport {{ {tcp_out_ports} }} ct state new accept" if tcp_out_ports else ""
     udp_in_rule = f"udp dport {{ {udp_in_ports} }} accept" if udp_in_ports else ""
     udp_out_rule = f"udp dport {{ {udp_out_ports} }} accept" if udp_out_ports else ""
+
+    ssh_rule = (
+        f"tcp dport {{ {', '.join(str(p) for p in ssh_ports)} }} ct state new accept"
+        if ssh_ports else ""
+    )
 
     # Container mode: the forward chain must stay permissive so container
     # networking (Docker/Podman NAT) keeps working. CrowdSec bans still apply
@@ -97,8 +108,8 @@ table inet filter {{
         ip  saddr @crowdsec-blacklists  drop
         ip6 saddr @crowdsec6-blacklists drop
 
-        # SSH
-        tcp dport {ssh_port} ct state new accept
+        # SSH (all effective listening ports)
+        {ssh_rule}
 
         # Additional inbound TCP
         {tcp_in_rule}

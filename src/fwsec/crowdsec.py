@@ -8,8 +8,6 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
 
 
 def _cscli(*args: str) -> tuple[int, str, str]:
@@ -44,7 +42,7 @@ class Decision:
     scope: str
 
 
-def list_decisions(ip: Optional[str] = None) -> list[Decision]:
+def list_decisions(ip: str | None = None) -> list[Decision]:
     args = ["decisions", "list", "-o", "json"]
     if ip:
         args += ["--ip", ip]
@@ -79,7 +77,7 @@ def list_decisions(ip: Optional[str] = None) -> list[Decision]:
 def add_decision(
     ip: str,
     reason: str = "manual ban",
-    duration: Optional[str] = None,
+    duration: str | None = None,
 ) -> bool:
     """Add a ban decision. duration=None means permanent (100y)."""
     args = ["decisions", "add", "--ip", ip, "--reason", reason, "--type", "ban"]

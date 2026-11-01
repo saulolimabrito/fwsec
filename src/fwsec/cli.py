@@ -10,15 +10,15 @@ import argparse
 import datetime
 import ipaddress
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from fwsec import __version__
+from fwsec import __version__, containers, crowdsec, nft, rules, state, upgrade
 from fwsec import config as cfg
-from fwsec import containers, crowdsec, nft, rules, state, upgrade
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -65,13 +65,99 @@ def _require_root() -> None:
 # SSH port detection
 # ---------------------------------------------------------------------------
 
-def _detect_ssh_port() -> int:
-    sshd_conf = Path("/etc/ssh/sshd_config")
-    if sshd_conf.exists():
-        for line in sshd_conf.read_text().splitlines():
-            if re.match(r"^Port\s+\d+", line):
-                return int(line.split()[1])
-    return 22
+_SSHD_CANDIDATES = ("/usr/sbin/sshd", "/usr/local/sbin/sshd")
+
+
+def _sshd_binary() -> str | None:
+    found = shutil.which("sshd")
+    if found:
+        return found
+    for candidate in _SSHD_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _ssh_ports_from_sshd_t() -> list[int]:
+    """Ports reported by `sshd -T` (effective configuration, includes drop-ins)."""
+    sshd = _sshd_binary()
+    if not sshd:
+        return []
+    try:
+        r = subprocess.run([sshd, "-T"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    ports: list[int] = []
+    for line in r.stdout.splitlines():
+        if line.startswith("port "):
+            try:
+                ports.append(int(line.split()[1]))
+            except (IndexError, ValueError):
+                pass
+    return ports
+
+
+def _ssh_ports_from_config() -> list[int]:
+    """Parse /etc/ssh/sshd_config plus every file reachable through its Include
+    directives (Ubuntu 22.10+, RHEL 9 and Fedora use sshd_config.d drop-ins).
+
+    Collects every Port directive — sshd may listen on several ports at once.
+    """
+    ports: list[int] = []
+    seen_files: set[Path] = set()
+
+    def _parse(path: Path) -> None:
+        if path in seen_files or not path.is_file():
+            return
+        seen_files.add(path)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            include = re.match(r"(?i)^Include\s+(.+)$", stripped)
+            if include:
+                for pattern in include.group(1).split():
+                    inc = Path(pattern)
+                    if not inc.is_absolute():
+                        inc = Path("/etc/ssh") / inc
+                    if "*" in inc.name or "?" in inc.name:
+                        parent = inc.parent
+                        if not parent.is_dir():
+                            continue
+                        pattern_re = re.escape(inc.name).replace(r"\*", ".*").replace(r"\?", ".")
+                        for child in sorted(parent.iterdir()):
+                            if re.fullmatch(pattern_re, child.name):
+                                _parse(child)
+                    elif inc.exists():
+                        _parse(inc)
+                continue
+            port = re.match(r"(?i)^Port\s+(\d+)", stripped)
+            if port:
+                ports.append(int(port.group(1)))
+
+    _parse(Path("/etc/ssh/sshd_config"))
+    return ports
+
+
+def _detect_ssh_ports() -> list[int]:
+    """Effective SSH listening ports, deduplicated.
+
+    `sshd -T` reflects the effective configuration; config parsing is the
+    fallback when sshd is unavailable and also catches extra Port directives
+    that some sshd -T versions omit. Opening a superset is always safe —
+    the alternative is locking yourself out of the server.
+    """
+    ports = _ssh_ports_from_sshd_t()
+    for p in _ssh_ports_from_config():
+        if p not in ports:
+            ports.append(p)
+    return sorted(set(ports)) or [22]
 
 
 # ---------------------------------------------------------------------------
@@ -90,14 +176,22 @@ def cmd_version(_args: argparse.Namespace) -> None:
 def cmd_start(_args: argparse.Namespace) -> None:
     _require_root()
     _info("Starting fwsec firewall...")
+
+    try:
+        nft.preflight()
+    except RuntimeError as e:
+        _err(str(e))
+        sys.exit(1)
+
     c = cfg.load_config()
-    ssh_port = _detect_ssh_port()
+    ssh_ports = _detect_ssh_ports()
+    ssh_label = ", ".join(str(p) for p in ssh_ports)
 
     # Build and apply filter table
-    filter_script = rules.generate_filter_table(c, ssh_port)
+    filter_script = rules.generate_filter_table(c, ssh_ports)
     try:
         nft._run_script(filter_script)
-        _ok(f"inet filter table loaded (SSH port {ssh_port}).")
+        _ok(f"inet filter table loaded (SSH port{'s' if len(ssh_ports) > 1 else ''}: {ssh_label}).")
     except RuntimeError as e:
         _err(f"Failed to load filter table: {e}")
         sys.exit(1)
@@ -178,21 +272,20 @@ def cmd_stop(_args: argparse.Namespace) -> None:
     _info("Stopping fwsec (flushing fwsec table, restoring permissive filter)...")
     nft.flush_table()
 
-    # Replace filter table with a permissive ruleset (keeps SSH open)
-    ssh_port = _detect_ssh_port()
-    permissive = f"""
+    # Replace filter table with a permissive ruleset (everything allowed)
+    permissive = """
 flush table inet filter
-table inet filter {{
-    chain input {{
+table inet filter {
+    chain input {
         type filter hook input priority filter; policy accept;
-    }}
-    chain forward {{
+    }
+    chain forward {
         type filter hook forward priority filter; policy accept;
-    }}
-    chain output {{
+    }
+    chain output {
         type filter hook output priority filter; policy accept;
-    }}
-}}
+    }
+}
 """
     try:
         nft._run_script(permissive)
@@ -288,8 +381,8 @@ def cmd_check(_args: argparse.Namespace) -> None:
         _info("CONTAINER_MODE = 1 but no running container runtime was found.")
 
     # SSH port
-    ssh_port = _detect_ssh_port()
-    _ok(f"SSH port detected: {ssh_port}")
+    ssh_ports = _detect_ssh_ports()
+    _ok(f"SSH port(s) detected: {', '.join(str(p) for p in ssh_ports)}")
 
     print()
     if issues == 0:
@@ -303,13 +396,13 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
     # Allowed ports (from fwsec.conf; SSH is detected and always open)
     c = cfg.load_config()
-    ssh_port = _detect_ssh_port()
+    ssh_ports = _detect_ssh_ports()
 
     def _ports(plist: list[str]) -> str:
         return ", ".join(plist) if plist else "(none)"
 
     print(f"\n{BOLD}Allowed ports{RESET}")
-    print(f"  {CYAN}TCP IN {RESET} : {ssh_port} (SSH)"
+    print(f"  {CYAN}TCP IN {RESET} : {', '.join(str(p) for p in ssh_ports)} (SSH)"
           f"{', ' + _ports(c.tcp_in) if c.tcp_in else ''}")
     print(f"  {CYAN}TCP OUT{RESET} : {_ports(c.tcp_out)}")
     print(f"  {CYAN}UDP IN {RESET} : {_ports(c.udp_in)}")
@@ -323,13 +416,12 @@ def cmd_list(_args: argparse.Namespace) -> None:
     summary = nft.get_summary()
     c_deny = crowdsec.list_decisions() if crowdsec.available() else []
 
-    state_data = state.load()
-
     def _comment(ip: str) -> str:
         c = state.get_comment(ip)
         return f"  # {c}" if c else ""
 
-    print(f"\n{BOLD}Allow list (fwsec-allow){RESET} — {len(summary.allow4) + len(summary.allow6)} IPs")
+    n_allow = len(summary.allow4) + len(summary.allow6)
+    print(f"\n{BOLD}Allow list (fwsec-allow){RESET} — {n_allow} IPs")
     for ip in summary.allow4 + summary.allow6:
         print(f"  {GREEN}{ip}{RESET}{_comment(ip)}")
 
@@ -413,7 +505,8 @@ def cmd_temp_deny(args: argparse.Namespace) -> None:
         crowdsec.add_decision(ip, reason=comment or "fwsec temp ban", duration=f"{duration_sec}s")
 
     expires = datetime.datetime.fromtimestamp(time.time() + duration_sec)
-    _ok(f"Temp blocked: {ip} until {expires:%Y-%m-%d %H:%M:%S}{f'  ({comment})' if comment else ''}")
+    suffix = f"  ({comment})" if comment else ""
+    _ok(f"Temp blocked: {ip} until {expires:%Y-%m-%d %H:%M:%S}{suffix}")
 
 
 def cmd_temp_list(_args: argparse.Namespace) -> None:
@@ -501,7 +594,7 @@ def cmd_grep(args: argparse.Namespace) -> None:
         # It's a hostname — resolve it
         try:
             infos = socket.getaddrinfo(target, None)
-            ips_to_check = list({i[4][0] for i in infos})
+            ips_to_check = list({str(i[4][0]) for i in infos})
             _info(f"Resolved {target} → {', '.join(ips_to_check)}")
         except socket.gaierror:
             _err(f"Could not resolve: {target}")
@@ -516,10 +609,10 @@ def cmd_grep(args: argparse.Namespace) -> None:
         # nftables allow set
         if nft.table_exists():
             if nft.is_allowed(ip):
-                _ok(f"  In fwsec ALLOW list")
+                _ok("  In fwsec ALLOW list")
                 found = True
             if nft.is_denied(ip):
-                _warn(f"  In fwsec DENY list")
+                _warn("  In fwsec DENY list")
                 found = True
 
         # Config files
@@ -622,18 +715,46 @@ def _fmt_duration(sec: int) -> str:
     return f"{h}h {m}m"
 
 
+NFTABLES_CONF_DEBIAN = Path("/etc/nftables.conf")
+NFTABLES_CONF_RHEL = Path("/etc/sysconfig/nftables.conf")
+_FWSEC_MARKER = "# Managed by fwsec"
+
+
+def _nftables_conf_path() -> Path:
+    """Config file loaded by the distribution's nftables.service.
+
+    RHEL-family and SUSE load /etc/sysconfig/nftables.conf; Debian, Ubuntu,
+    Arch and Alpine load /etc/nftables.conf. Writing the wrong file silently
+    loses the rules at every reboot.
+    """
+    if NFTABLES_CONF_RHEL.exists():
+        return NFTABLES_CONF_RHEL
+    return NFTABLES_CONF_DEBIAN
+
+
 def _persist_nftables() -> None:
-    """Save fwsec's tables to /etc/nftables.conf for persistence across reboots.
+    """Save fwsec's tables to the distro's nftables config for persistence
+    across reboots.
 
     Only the tables fwsec owns are saved — persisting the full ruleset would
     freeze dynamic rules from other owners (Docker, Podman, libvirt) and
     restore stale copies of them at boot.
     """
     out = nft.list_fwsec_tables()
-    if out:
-        Path("/etc/nftables.conf").write_text(
-            "#!/usr/sbin/nft -f\nflush ruleset\n\n" + out
-        )
+    if not out:
+        return
+
+    conf = _nftables_conf_path()
+    if conf.exists():
+        content = conf.read_text(errors="replace")
+        if _FWSEC_MARKER not in content:
+            # First fwsec write over a foreign config — keep a backup
+            backup = conf.parent / (conf.name + ".fwsec.bak")
+            shutil.copy2(conf, backup)
+
+    conf.write_text(
+        "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\nflush ruleset\n\n" + out
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +860,8 @@ def main() -> None:
         cmd_check(args)
 
     elif args.deny:
-        ns = argparse.Namespace(ip=args.deny[0], comment=" ".join(args.deny[1:]) if len(args.deny) > 1 else "")
+        comment = " ".join(args.deny[1:]) if len(args.deny) > 1 else ""
+        ns = argparse.Namespace(ip=args.deny[0], comment=comment)
         cmd_deny(ns)
 
     elif args.deny_remove:
@@ -762,7 +884,8 @@ def main() -> None:
         cmd_temp_remove(argparse.Namespace(ip=args.temp_remove))
 
     elif args.allow:
-        ns = argparse.Namespace(ip=args.allow[0], comment=" ".join(args.allow[1:]) if len(args.allow) > 1 else "")
+        comment = " ".join(args.allow[1:]) if len(args.allow) > 1 else ""
+        ns = argparse.Namespace(ip=args.allow[0], comment=comment)
         cmd_allow(ns)
 
     elif args.allow_remove:

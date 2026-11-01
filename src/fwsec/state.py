@@ -13,8 +13,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from fwsec.config import STATE_FILE
 
@@ -48,16 +47,17 @@ class State:
     deny_meta: dict[str, DenyEntry]      # ip -> DenyEntry
 
 
-def _load_raw() -> dict:
+def _load_raw() -> dict[str, Any]:
     if not STATE_FILE.exists():
         return {"temp_blocks": {}, "allow_meta": {}, "deny_meta": {}}
     try:
-        return json.loads(STATE_FILE.read_text())
+        data: dict[str, Any] = json.loads(STATE_FILE.read_text())
+        return data
     except (json.JSONDecodeError, OSError):
         return {"temp_blocks": {}, "allow_meta": {}, "deny_meta": {}}
 
 
-def _save_raw(data: dict) -> None:
+def _save_raw(data: dict[str, Any]) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(data, indent=2))
 

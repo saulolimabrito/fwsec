@@ -17,22 +17,22 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
 
 REPO = "saulolimabrito/fwsec"
 _TIMEOUT = 20
 
 
-def _get(url: str) -> Optional[bytes]:
+def _get(url: str) -> bytes | None:
     req = urllib.request.Request(url, headers={"User-Agent": "fwsec-upgrade"})
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            return resp.read()
+            data: bytes = resp.read()
+            return data
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
 
-def fetch_remote_version() -> Optional[str]:
+def fetch_remote_version() -> str | None:
     """Latest version in the repository: release tag, else pyproject on main."""
     data = _get(f"https://api.github.com/repos/{REPO}/releases/latest")
     if data:
@@ -78,7 +78,7 @@ def _extract_safely(tar: tarfile.TarFile, destination: Path) -> None:
     tar.extractall(destination)
 
 
-def download_source(version: str) -> Optional[Path]:
+def download_source(version: str) -> Path | None:
     """Download and extract the source tarball; returns the source directory."""
     data = _get(f"https://github.com/{REPO}/archive/refs/tags/v{version}.tar.gz")
     if data is None:

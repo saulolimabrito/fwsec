@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
 
 NFT_FAMILY = "inet"
 NFT_TABLE = "fwsec"
@@ -25,20 +25,32 @@ SET_ALLOW6 = "allow6"
 SET_DENY4 = "deny4"
 SET_DENY6 = "deny6"
 
+# `priority filter` (symbolic), `auto-merge` and `ct original proto-dst`
+# require nftables 0.9.0+ / kernel 4.18+ (RHEL 8, Debian 10, Ubuntu 18.04).
+MIN_NFT_VERSION = (0, 9, 0)
+
 
 # ---------------------------------------------------------------------------
 # Low-level runner
 # ---------------------------------------------------------------------------
 
 def _run(*args: str, check: bool = False) -> tuple[int, str, str]:
-    r = subprocess.run(["nft", *args], capture_output=True, text=True)
+    try:
+        r = subprocess.run(["nft", *args], capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return 127, "", "nft binary is not available"
     if check and r.returncode != 0:
         raise RuntimeError(f"nft {' '.join(args)}: {r.stderr.strip()}")
     return r.returncode, r.stdout, r.stderr
 
 
 def _run_script(script: str, check: bool = True) -> tuple[int, str, str]:
-    r = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True, text=True)
+    try:
+        r = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        if check:
+            raise RuntimeError(f"nft is not available: {e}")
+        return 127, "", str(e)
     if check and r.returncode != 0:
         raise RuntimeError(f"nft script error: {r.stderr.strip()}")
     return r.returncode, r.stdout, r.stderr
@@ -59,6 +71,53 @@ def _set_for(ip: str, kind: str) -> str:
     """Return the set name for the given IP and kind ('allow'|'deny')."""
     v = _ip_version(ip)
     return f"{kind}{v}"
+
+
+# ---------------------------------------------------------------------------
+# Environment preflight
+# ---------------------------------------------------------------------------
+
+def version() -> tuple[int, ...] | None:
+    """Installed nft version as a tuple, or None when it cannot be parsed."""
+    rc, out, _ = _run("--version")
+    if rc != 0:
+        return None
+    m = re.search(r"v?(\d+)\.(\d+)(?:\.(\d+))?", out)
+    if not m:
+        return None
+    return tuple(int(x) if x else 0 for x in m.groups())
+
+
+def preflight() -> None:
+    """Fail with a clear, actionable message when nftables is unusable here.
+
+    Covers the common cross-distro failure modes: missing binary, version
+    below the 0.9.0 syntax floor, and kernels without nf_tables support
+    (OpenVZ/Virtuozzo containers, stripped-down VPS kernels).
+    """
+    if shutil.which("nft") is None:
+        raise RuntimeError(
+            "The nftables binary ('nft') was not found. "
+            "Install nftables with the distribution package manager."
+        )
+
+    ver = version()
+    if ver is not None and ver < MIN_NFT_VERSION:
+        ver_str = ".".join(str(x) for x in ver)
+        min_str = ".".join(str(x) for x in MIN_NFT_VERSION)
+        raise RuntimeError(
+            f"nftables {ver_str} is too old (fwsec requires >= {min_str}, "
+            "which needs kernel >= 4.18)."
+        )
+
+    rc, _, err = _run("list", "ruleset")
+    if rc != 0:
+        raise RuntimeError(
+            "nftables is not usable on this kernel: 'nft list ruleset' failed"
+            + (f" ({err.strip()})" if err.strip() else "")
+            + ". This happens on kernels without nf_tables support "
+            "(e.g. OpenVZ/Virtuozzo) or with missing nf_tables kernel modules."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +193,7 @@ table {NFT_FAMILY} {NFT_TABLE} {{
 # Set element management
 # ---------------------------------------------------------------------------
 
-def add_element(set_name: str, ip: str, timeout_sec: Optional[int] = None) -> None:
+def add_element(set_name: str, ip: str, timeout_sec: int | None = None) -> None:
     if timeout_sec is not None:
         element = f"{{ {ip} timeout {timeout_sec}s }}"
     else:
@@ -184,7 +243,7 @@ def unallow(ip: str) -> bool:
     return delete_element(set_name, ip)
 
 
-def deny(ip: str, timeout_sec: Optional[int] = None) -> None:
+def deny(ip: str, timeout_sec: int | None = None) -> None:
     set_name = _set_for(ip, "deny")
     add_element(set_name, ip, timeout_sec)
 

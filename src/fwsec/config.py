@@ -228,6 +228,6 @@ def set_enabled(value: bool) -> None:
                 lines.insert(i + 1, f"ENABLED = {flag}")
                 break
         else:
-            lines = [f"[firewall]", f"ENABLED = {flag}", ""] + lines
+            lines = ["[firewall]", f"ENABLED = {flag}", ""] + lines
 
     CONF_FILE.write_text("\n".join(lines) + "\n")
