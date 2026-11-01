@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (shellcheck, ruff, mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          python3 -m pip install --quiet ruff mypy
+      - name: shellcheck (install.sh)
+        run: shellcheck -S warning install.sh
+      - name: ruff (src, target py38)
+        run: ruff check src
+      - name: mypy (src, strict)
+        run: mypy src
+
+  python-floor:
+    name: Python 3.8 floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Provision Python 3.8 and install fwsec
+        run: |
+          uv python install 3.8
+          uv venv .venv --python 3.8
+          uv pip install --python .venv/bin/python .
+      - name: Smoke (fwsec -v / -c)
+        run: |
+          .venv/bin/fwsec -v
+          .venv/bin/fwsec -c
+
+  install-smoke:
+    name: Install smoke — ${{ matrix.container }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - rockylinux:8
+          - rockylinux:9
+          - fedora:latest
+          - amazonlinux:2023
+          - opensuse/leap:15.6
+          - archlinux:latest
+    container: ${{ matrix.container }}
+    steps:
+      - name: Bootstrap (git + curl needed by the checkout action)
+        run: |
+          . /etc/os-release
+          case "${ID}" in
+            debian|ubuntu) apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null ;;
+            rocky|almalinux|rhel|centos) dnf install -y -q git curl tar ca-certificates >/dev/null ;;
+            fedora) dnf install -y -q git curl tar >/dev/null ;;
+            amzn) dnf install -y -q git curl tar >/dev/null ;;
+            opensuse-leap|sles) zypper --non-interactive install git curl tar ca-certificates >/dev/null ;;
+            arch) pacman -Sy --noconfirm git curl >/dev/null ;;
+          esac
+      - uses: actions/checkout@v4
+      - name: Run installer (--force, non-interactive)
+        run: bash install.sh --force
+      - name: Smoke (fwsec -v / -c)
+        run: |
+          fwsec -v
+          fwsec -c
+
+  install-smoke-alpine:
+    name: Install smoke — alpine:3.20 (musl + OpenRC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run installer inside alpine:3.20
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:3.20 sh -c '
+            apk add --no-cache bash git curl tar >/dev/null &&
+            bash install.sh --force &&
+            fwsec -v &&
+            fwsec -c
+          '
