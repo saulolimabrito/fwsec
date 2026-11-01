@@ -17,6 +17,8 @@ ALLOW_FILE = CONFIG_DIR / "fwsec.allow"
 DENY_FILE = CONFIG_DIR / "fwsec.deny"
 IGNORE_FILE = CONFIG_DIR / "fwsec.ignore"
 STATE_FILE = CONFIG_DIR / "fwsec.state.json"
+GEO_DIR = CONFIG_DIR / "geo"
+GEO_INDEX_FILE = GEO_DIR / "index.tsv"
 
 DEFAULTS: dict[str, dict[str, str]] = {
     "firewall": {
@@ -28,6 +30,9 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "ICMP_IN": "1",
         "IPV6": "1",
         "WHITELIST_MARK": "0",
+        "GEO_BLOCK": "",
+        "GEO_ALLOW": "",
+        "GEO_FORWARD": "0",
         "DENY_TEMP_IP_LIMIT": "100",
         "DENY_IP_LIMIT": "1000",
     },
@@ -57,6 +62,9 @@ class FwsecConfig:
     icmp_in: bool = True
     ipv6: bool = True
     whitelist_mark: bool = False
+    geo_block: list[str] = field(default_factory=list)
+    geo_allow: list[str] = field(default_factory=list)
+    geo_forward: bool = False
     deny_temp_limit: int = 100
     deny_limit: int = 1000
     container_mode: bool = False
@@ -90,6 +98,9 @@ def load_config() -> FwsecConfig:
         icmp_in=fw.getboolean("ICMP_IN", True),
         ipv6=fw.getboolean("IPV6", True),
         whitelist_mark=fw.getboolean("WHITELIST_MARK", False),
+        geo_block=parse_country_codes(fw.get("GEO_BLOCK", "")),
+        geo_allow=parse_country_codes(fw.get("GEO_ALLOW", "")),
+        geo_forward=fw.getboolean("GEO_FORWARD", False),
         deny_temp_limit=fw.getint("DENY_TEMP_IP_LIMIT", 100),
         deny_limit=fw.getint("DENY_IP_LIMIT", 1000),
         container_mode=ct.getboolean("CONTAINER_MODE", False),
@@ -104,6 +115,34 @@ def load_config() -> FwsecConfig:
 
 def _parse_ports(value: str) -> list[str]:
     return [p.strip() for p in value.split(",") if p.strip()]
+
+
+def parse_country_codes(value: str) -> list[str]:
+    """Parse a comma-separated ISO-3166 alpha-2 country list ("br, us")."""
+    codes = []
+    for raw in value.split(","):
+        cc = raw.strip().lower()
+        if cc:
+            codes.append(cc)
+    return codes
+
+
+def geo_mode(cfg: FwsecConfig) -> str:
+    """Resolve the geo policy mode: 'off', 'deny' or 'allow'.
+
+    GEO_BLOCK (deny-list countries) and GEO_ALLOW (deny everything except the
+    listed countries) are mutually exclusive — raising here surfaces the
+    misconfiguration on every command that loads the config.
+    """
+    if cfg.geo_block and cfg.geo_allow:
+        raise ValueError(
+            "GEO_BLOCK and GEO_ALLOW are mutually exclusive: use one or the other."
+        )
+    if cfg.geo_allow:
+        return "allow"
+    if cfg.geo_block:
+        return "deny"
+    return "off"
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from fwsec import __version__, containers, crowdsec, nft, rules, state, upgrade
+from fwsec import __version__, containers, crowdsec, geo, nft, rules, state, upgrade
 from fwsec import config as cfg
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,17 @@ def cmd_start(_args: argparse.Namespace) -> None:
         sys.exit(1)
 
     c = cfg.load_config()
+
+    # Safety gate: an allow-mode policy with empty country sets is a
+    # deny-everything firewall — it would drop SSH and lock everyone out.
+    if cfg.geo_mode(c) == "allow":
+        c4, c6 = geo.resolve_all(c.geo_allow)
+        if not c4 and not c6:
+            _err("GEO_ALLOW is configured but no zone data is on disk "
+                 "(run: fwsec --geo-update).")
+            _err("Refusing to apply a deny-all policy with empty country sets.")
+            sys.exit(1)
+
     ssh_ports = _detect_ssh_ports()
     ssh_label = ", ".join(str(p) for p in ssh_ports)
 
@@ -222,6 +233,27 @@ def cmd_start(_args: argparse.Namespace) -> None:
                 nft.deny(t.ip, remaining)
             except (ValueError, RuntimeError):
                 pass
+
+    # Geo policy (deny/allow) — bulk load the country sets in one nft -f
+    mode = cfg.geo_mode(c)
+    if mode != "off":
+        codes = c.geo_block or c.geo_allow
+        g4, g6 = geo.resolve_all(codes)
+        if not g4 and not g6:
+            _warn(f"Geo policy ({mode}) configured but no zone data on disk. "
+                  "Run: fwsec --geo-update")
+        else:
+            script = geo.render_apply_file(codes)
+            try:
+                nft._run_script(script)
+                _ok(f"Geo policy ({mode}): {', '.join(codes)} — "
+                    f"{len(g4)} IPv4 + {len(g6)} IPv6 CIDRs loaded.")
+            except RuntimeError as e:
+                _err(f"Failed to load the geo sets: {e}")
+        if mode == "allow":
+            _warn("GEO ALLOW MODE: traffic from outside "
+                  f"[{', '.join(codes)}] is dropped at priority -40.")
+            _warn("Admin IPs in fwsec.allow always override geo — verify yours is listed.")
 
     _ok(f"Allow list: {len(allow_entries)} IPs, Deny list: {len(deny_entries)} IPs, "
         f"Temp blocks: {len(temp)} IPs.")
@@ -384,6 +416,36 @@ def cmd_check(_args: argparse.Namespace) -> None:
     ssh_ports = _detect_ssh_ports()
     _ok(f"SSH port(s) detected: {', '.join(str(p) for p in ssh_ports)}")
 
+    # Geo policy
+    gmode = cfg.geo_mode(c)
+    if gmode == "off":
+        _info("Geo policy: off (GEO_BLOCK/GEO_ALLOW not set)")
+    else:
+        codes = c.geo_block or c.geo_allow
+        _ok(f"Geo policy: {gmode} mode — countries: {', '.join(codes)}")
+        g4, g6 = geo.resolve_all(codes)
+        if not g4 and not g6:
+            if gmode == "allow":
+                _err("GEO_ALLOW active with no zone data — run 'fwsec --geo-update' "
+                     "BEFORE 'fwsec -r', or every non-private source will be dropped.")
+                issues += 1
+            else:
+                _warn("Geo zones not downloaded yet. Run: fwsec --geo-update")
+                issues += 1
+        if nft.table_exists() and (g4 or g6):
+            loaded4 = len(nft.list_elements("geo4"))
+            loaded6 = len(nft.list_elements("geo6"))
+            _ok(f"Geo sets loaded: {loaded4} IPv4 / {loaded6} IPv6 elements")
+        ts = geo.zones_last_updated()
+        if ts:
+            age = (time.time() - ts) / 86400
+            if age > 30:
+                _warn(f"Geo zone data is {age:.0f} days old. Run: fwsec --geo-update")
+        if gmode == "allow" and not allow_list:
+            _warn("GEO_ALLOW active and fwsec.allow is EMPTY — add your admin "
+                  "IP ('fwsec -a YOUR_IP') to guarantee recovery access.")
+            issues += 1
+
     print()
     if issues == 0:
         _ok("Configuration OK.")
@@ -442,6 +504,17 @@ def cmd_list(_args: argparse.Namespace) -> None:
             local = "  (local only)" if p.host_ip in ("127.0.0.1", "::1", "[::1]") else ""
             print(f"  {CYAN}{p.host_port}/{p.proto}{RESET} → "
                   f"{p.container}:{p.container_port} [{p.runtime}]{local}")
+
+    gmode = cfg.geo_mode(c)
+    if gmode != "off":
+        gcodes = c.geo_block or c.geo_allow
+        print(f"\n{BOLD}Geo policy ({gmode}){RESET} — countries: {', '.join(gcodes)}")
+        counts = geo.zone_counts(gcodes)
+        for cc in gcodes:
+            print(f"  {CYAN}{cc}{RESET}: {counts.get(cc, 0)} CIDRs")
+        if nft.table_exists():
+            print(f"  Loaded in nftables: {len(nft.list_elements('geo4'))} IPv4 / "
+                  f"{len(nft.list_elements('geo6'))} IPv6")
 
     print()
 
@@ -584,6 +657,7 @@ def cmd_allow_remove(args: argparse.Namespace) -> None:
 
 def cmd_grep(args: argparse.Namespace) -> None:
     target = args.target
+    c = cfg.load_config()
 
     # Resolve domain to IPs if needed
     ips_to_check: list[str] = []
@@ -637,6 +711,30 @@ def cmd_grep(args: argparse.Namespace) -> None:
                 _warn(f"  In TEMP BLOCK list (expires {exp}) — {t.comment}")
                 found = True
 
+        # Geo policy
+        gmode = cfg.geo_mode(c)
+        if gmode != "off":
+            gcodes = c.geo_block or c.geo_allow
+            country = geo.lookup_country(ip, gcodes)
+            if nft.table_exists():
+                in_geo = (
+                    nft.element_exists("geo4", ip) or nft.element_exists("geo6", ip)
+                )
+                where = f" ({country})" if country else ""
+                if gmode == "deny" and in_geo:
+                    _warn(f"  In GEO BLOCK set{where} — traffic dropped")
+                    found = True
+                elif gmode == "allow":
+                    if in_geo:
+                        _ok(f"  In GEO ALLOW set{where} — traffic accepted")
+                        found = True
+                    else:
+                        _warn("  NOT in the geo allow set — traffic dropped (deny all)")
+                        found = True
+            elif country:
+                _info(f"  In the {gmode}-mode zones for {country} (set not loaded)")
+                found = True
+
         # CrowdSec
         if crowdsec.available():
             decisions = crowdsec.grep_ip(ip)
@@ -653,6 +751,75 @@ def cmd_grep(args: argparse.Namespace) -> None:
             _info(f"  {ip} not found in any fwsec or CrowdSec list.")
 
     print()
+
+
+def cmd_geo_update(_args: argparse.Namespace) -> None:
+    """Refresh country zone data and reload the geo sets."""
+    _require_root()
+    c = cfg.load_config()
+    codes = c.geo_block or c.geo_allow
+    if not codes:
+        _err("Geo policy is disabled. Set GEO_BLOCK or GEO_ALLOW in "
+             f"{cfg.CONF_FILE} first.")
+        sys.exit(1)
+    mode = cfg.geo_mode(c)
+    _info(f"Updating country zones ({', '.join(codes)}) [mode: {mode}]...")
+
+    updated, failed = geo.update_zones(codes)
+    if failed:
+        _warn(f"Failed to update: {', '.join(failed)} (previous zones kept)")
+    if not updated:
+        _err("No country zone was updated.")
+        sys.exit(1)
+    g4, g6 = geo.resolve_all(updated)
+    _ok(f"Zones updated: {len(updated)} countries, "
+        f"{len(g4)} IPv4 + {len(g6)} IPv6 CIDRs.")
+
+    if nft.table_exists():
+        script = geo.render_apply_file(updated)
+        try:
+            nft._run_script(script)
+            _ok("geo4/geo6 sets reloaded in nftables.")
+        except RuntimeError as e:
+            _warn(f"Could not reload the geo sets: {e}")
+            _info("If the geo sets are missing from the table, run: fwsec -r")
+    else:
+        _info("fwsec table not loaded — run 'fwsec -s' to apply the geo policy.")
+
+
+def cmd_geo_status(_args: argparse.Namespace) -> None:
+    """Show the geo policy status."""
+    c = cfg.load_config()
+    mode = cfg.geo_mode(c)
+    codes = c.geo_block or c.geo_allow
+
+    _header("fwsec — geo policy")
+    print(f"  Mode     : {mode}")
+    if mode == "off":
+        print("  Set GEO_BLOCK or GEO_ALLOW in fwsec.conf to enable.")
+        print("  GEO_BLOCK = \"cn,ru\"  → drop the listed countries")
+        print("  GEO_ALLOW  = \"br\"    → drop everyone EXCEPT the listed countries")
+        return
+    print(f"  Countries: {', '.join(codes)}")
+    counts = geo.zone_counts(codes)
+    for cc in codes:
+        print(f"    {cc}: {counts.get(cc, 0)} CIDRs")
+    g4, g6 = geo.resolve_all(codes)
+    print(f"  Total    : {len(g4)} IPv4 + {len(g6)} IPv6 CIDRs")
+    if nft.table_exists():
+        print(f"  Loaded   : {len(nft.list_elements('geo4'))} IPv4 / "
+              f"{len(nft.list_elements('geo6'))} IPv6 elements in nftables")
+    else:
+        print("  Loaded   : fwsec table not loaded (run: fwsec -s)")
+    ts = geo.zones_last_updated()
+    if ts:
+        age_days = (time.time() - ts) / 86400
+        updated = datetime.datetime.fromtimestamp(ts)
+        print(f"  Updated  : {updated:%Y-%m-%d %H:%M} ({age_days:.1f} days ago)")
+        if age_days > 30:
+            _warn("  Zone data is stale (> 30 days). Run: fwsec --geo-update")
+    else:
+        _warn("  No zone data on disk. Run: fwsec --geo-update")
 
 
 def cmd_upgrade(_args: argparse.Namespace) -> None:
@@ -800,6 +967,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   fwsec --upgrade                   Update fwsec from GitHub (config preserved)
+  fwsec --geo-update                Refresh country zones and reload geo sets
+  fwsec --geo-status                Show the geo policy status
   fwsec -s                          Start firewall
   fwsec -r                          Reload rules
   fwsec -l                          List loaded rules
@@ -822,6 +991,10 @@ Examples:
     g.add_argument("--upgrade",         action="store_true",
                    help="Update fwsec from the GitHub repository "
                         "(local configuration is preserved)")
+    g.add_argument("--geo-update",      dest="geo_update", action="store_true",
+                   help="Refresh country zones and reload the geo sets")
+    g.add_argument("--geo-status",      dest="geo_status", action="store_true",
+                   help="Show the geo policy status")
     g.add_argument("-l", "--list",      action="store_true", help="List loaded rules")
     g.add_argument("-s", "--start",     action="store_true", help="Start firewall")
     g.add_argument("-f", "--stop",      action="store_true", help="Stop firewall (flush rules)")
@@ -861,13 +1034,27 @@ Examples:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        _run_command(parser, args)
+    except ValueError as e:
+        # Configuration errors (e.g. GEO_BLOCK and GEO_ALLOW set together)
+        _err(str(e))
+        sys.exit(1)
 
+
+def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     # Map parsed args to command functions
     if args.version:
         cmd_version(args)
 
     elif args.upgrade:
         cmd_upgrade(args)
+
+    elif args.geo_update:
+        cmd_geo_update(args)
+
+    elif args.geo_status:
+        cmd_geo_status(args)
 
     elif args.list:
         cmd_list(args)

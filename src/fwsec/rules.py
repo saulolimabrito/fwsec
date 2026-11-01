@@ -12,7 +12,7 @@ before the `inet filter` chain (priority 0).
 """
 from __future__ import annotations
 
-from fwsec.config import FwsecConfig
+from fwsec.config import FwsecConfig, geo_mode
 
 FILTER_TABLE = "inet filter"
 
@@ -199,7 +199,7 @@ table inet fwsec {
 @@MARK_ACCEPT@@        ip  saddr @deny4 drop
         ip6 saddr @deny6 drop
     }
-}
+@@GEO@@}
 """
 
 
@@ -223,7 +223,92 @@ def generate_fwsec_table(cfg: FwsecConfig) -> str:
         .replace("@@ALLOW4_RULE@@", allow4_rule)
         .replace("@@ALLOW6_RULE@@", allow6_rule)
         .replace("@@MARK_ACCEPT@@", mark_accept)
+        .replace("@@GEO@@", _geo_section(cfg))
     )
+
+
+# Private/link-local ranges exempt from geo filtering — internal traffic
+# (VM NAT, containers, DHCP, loopback) must never be dropped by country
+# policy. Rendered as inline anonymous sets: static content, evaluated fast.
+_GEO_PRIVATE_V4 = (
+    "ip  saddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, "
+    "169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } accept"
+)
+_GEO_PRIVATE_V6 = "ip6 saddr { ::1/128, fe80::/10, fc00::/7 } accept"
+
+
+def _geo_section(cfg: FwsecConfig) -> str:
+    """geo4/geo6 sets + hook chains, per mode. Empty string when geo is off.
+
+    Deny mode: policy accept, listed countries dropped (priority -40, after
+    the fwsec deny list at -50, before the main filter at 0).
+    Allow mode ("deny all, allow a few"): policy drop — only the fwsec allow
+    list, the allowed countries and internal/private sources pass. The allow
+    list is accepted first so admins listed in fwsec.allow always keep access.
+    """
+    mode = geo_mode(cfg)
+    if mode == "off":
+        return ""
+
+    sets = """
+    set geo4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    set geo6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+"""
+    if mode == "deny":
+        verdict = "accept"
+        input_rules = (
+            "        ip  saddr @allow4 accept\n"
+            "        ip6 saddr @allow6 accept\n"
+            "        ip  saddr @geo4 drop\n"
+            "        ip6 saddr @geo6 drop"
+        )
+        forward_rules = input_rules
+    else:  # allow mode — policy drop, only explicit accepts pass
+        verdict = "drop"
+        input_rules = (
+            "        ip  saddr @allow4 accept\n"
+            "        ip6 saddr @allow6 accept\n"
+            "        ip  saddr @geo4 accept\n"
+            "        ip6 saddr @geo6 accept\n"
+            f"        {_GEO_PRIVATE_V4}\n"
+            f"        {_GEO_PRIVATE_V6}"
+        )
+        forward_rules = (
+            "        ip  saddr @allow4 accept\n"
+            "        ip6 saddr @allow6 accept\n"
+            "        ip  saddr @geo4 accept\n"
+            "        ip6 saddr @geo6 accept\n"
+            f"        {_GEO_PRIVATE_V4}\n"
+            f"        {_GEO_PRIVATE_V6}"
+        )
+
+    mode_note = (
+        " — deny all, allow only the listed countries" if mode == "allow" else ""
+    )
+    section = f"""
+{sets}    # Geo policy ({mode} mode){mode_note}
+    chain geo_blacklist {{
+        type filter hook input priority -40; policy {verdict};
+{input_rules}
+    }}
+"""
+    if cfg.geo_forward:
+        section += f"""
+    chain geo_blacklist_forward {{
+        type filter hook forward priority -40; policy {verdict};
+{forward_rules}
+    }}
+"""
+    return section
 
 
 def generate_container_filter(

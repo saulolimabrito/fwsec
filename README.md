@@ -151,6 +151,8 @@ The result identifies whether the address appears in `fwsec.allow`, `fwsec.deny`
 |---|---|
 | `fwsec -v` | Show version information |
 | `fwsec --upgrade` | Update fwsec from the GitHub repository, preserving all local configuration |
+| `fwsec --geo-update` | Refresh country zone data and reload the geo sets |
+| `fwsec --geo-status` | Show the geo policy status (mode, countries, CIDR counts) |
 | `fwsec -l` | Show loaded rules, including every allowed port (TCP/UDP, inbound and outbound, plus the auto-detected SSH port and ICMP state) |
 | `fwsec -s` | Start the firewall |
 | `fwsec -f` | Stop the firewall |
@@ -169,6 +171,42 @@ The result identifies whether the address appears in `fwsec.allow`, `fwsec.deny`
 | `fwsec -ar IP` | Remove an IP address from the allow list |
 | `fwsec -g IP` | Search for an IP address in lists and rules |
 | `fwsec -g domain` | Search for a domain |
+
+## Country blocking (geo)
+
+fwsec can enforce a country policy using nftables interval sets fed with
+public CIDR zone data (ipdeny.com by default — no API key). Two modes,
+mutually exclusive, set in `/etc/fwsec/fwsec.conf`:
+
+```ini
+[firewall]
+GEO_BLOCK = "cn,ru"   # deny-list: drop traffic from the listed countries
+GEO_ALLOW  = "br"     # deny all: drop everyone EXCEPT the listed countries
+GEO_FORWARD = 0       # 1 = also apply the policy on the forward hook
+```
+
+The geo chain runs at priority -40 — after the fwsec deny list (-50) and
+before the main filter (0). IPs in `fwsec.allow` **always override** the geo
+policy (they are accepted first), so an admin IP listed there keeps access
+regardless of country. In allow mode ("deny all"), loopback, link-local,
+private and CGNAT ranges are always exempt — VM/container internal traffic
+and DHCP keep working.
+
+Workflow:
+
+```bash
+# 1. Set GEO_BLOCK or GEO_ALLOW in /etc/fwsec/fwsec.conf
+# 2. Download the zone data and reload the sets:
+sudo fwsec --geo-update
+# 3. Check status (mode, countries, CIDR counts, data age):
+sudo fwsec --geo-status
+```
+
+`fwsec -g IP` reports whether an IP is in the geo set and its country;
+`fwsec -l` shows the active geo policy. Zone data older than 30 days is
+flagged by `fwsec -c` and `--geo-status`. A failed download never removes
+the currently applied sets — zones are written atomically and only flushed
+once new data is fully in place.
 
 ## Configuration files
 
