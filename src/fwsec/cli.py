@@ -199,7 +199,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
     # Build and apply fwsec table (flush first to avoid set conflicts on re-start)
     if nft.table_exists():
         nft.flush_table()
-    fwsec_script = rules.generate_fwsec_table()
+    fwsec_script = rules.generate_fwsec_table(c)
     try:
         nft._run_script(fwsec_script)
         _ok("inet fwsec table loaded.")
@@ -717,6 +717,7 @@ def _fmt_duration(sec: int) -> str:
 
 NFTABLES_CONF_DEBIAN = Path("/etc/nftables.conf")
 NFTABLES_CONF_RHEL = Path("/etc/sysconfig/nftables.conf")
+NFTABLES_RHEL_INCLUDE = Path("/etc/nftables/fwsec.nft")
 _FWSEC_MARKER = "# Managed by fwsec"
 
 
@@ -733,18 +734,50 @@ def _nftables_conf_path() -> Path:
 
 
 def _persist_nftables() -> None:
-    """Save fwsec's tables to the distro's nftables config for persistence
-    across reboots.
+    """Save fwsec's tables for persistence across reboots.
 
     Only the tables fwsec owns are saved — persisting the full ruleset would
     freeze dynamic rules from other owners (Docker, Podman, libvirt) and
     restore stale copies of them at boot.
+
+    Debian-family: /etc/nftables.conf is the file nftables.service loads;
+    write the tables there directly.
+
+    RHEL-family/SUSE: /etc/sysconfig/nftables.conf is an admin-owned include
+    list that may pull in other rule files (management guards, NAT helpers).
+    Write the tables to /etc/nftables/fwsec.nft and make sure the loader
+    includes that file instead of clobbering the admin's includes. When the
+    loader was previously written wholesale by fwsec, refresh it in place.
     """
     out = nft.list_fwsec_tables()
     if not out:
         return
 
-    conf = _nftables_conf_path()
+    body = "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\nflush ruleset\n\n" + out
+
+    if NFTABLES_CONF_RHEL.exists():
+        NFTABLES_RHEL_INCLUDE.parent.mkdir(parents=True, exist_ok=True)
+        NFTABLES_RHEL_INCLUDE.write_text(
+            "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\n\n" + out
+        )
+
+        conf = NFTABLES_CONF_RHEL
+        content = conf.read_text(errors="replace") if conf.exists() else ""
+        if _FWSEC_MARKER in content:
+            # Loader previously written wholesale by fwsec: refresh in place.
+            conf.write_text(body)
+            return
+        include_line = f'include "{NFTABLES_RHEL_INCLUDE}"'
+        if include_line not in content:
+            if content.strip():
+                backup = conf.parent / (conf.name + ".fwsec.bak")
+                shutil.copy2(conf, backup)
+            content = content.rstrip("\n") + "\n" + include_line + "\n" if content \
+                else "#!/usr/sbin/nft -f\n" + include_line + "\n"
+            conf.write_text(content)
+        return
+
+    conf = NFTABLES_CONF_DEBIAN
     if conf.exists():
         content = conf.read_text(errors="replace")
         if _FWSEC_MARKER not in content:
@@ -752,9 +785,7 @@ def _persist_nftables() -> None:
             backup = conf.parent / (conf.name + ".fwsec.bak")
             shutil.copy2(conf, backup)
 
-    conf.write_text(
-        "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\nflush ruleset\n\n" + out
-    )
+    conf.write_text(body)
 
 
 # ---------------------------------------------------------------------------

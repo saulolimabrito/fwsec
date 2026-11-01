@@ -27,6 +27,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "UDP_OUT": "53,123",
         "ICMP_IN": "1",
         "IPV6": "1",
+        "WHITELIST_MARK": "0",
         "DENY_TEMP_IP_LIMIT": "100",
         "DENY_IP_LIMIT": "1000",
     },
@@ -55,6 +56,7 @@ class FwsecConfig:
     udp_out: list[str] = field(default_factory=list)
     icmp_in: bool = True
     ipv6: bool = True
+    whitelist_mark: bool = False
     deny_temp_limit: int = 100
     deny_limit: int = 1000
     container_mode: bool = False
@@ -87,6 +89,7 @@ def load_config() -> FwsecConfig:
         udp_out=_parse_ports(fw.get("UDP_OUT", "")),
         icmp_in=fw.getboolean("ICMP_IN", True),
         ipv6=fw.getboolean("IPV6", True),
+        whitelist_mark=fw.getboolean("WHITELIST_MARK", False),
         deny_temp_limit=fw.getint("DENY_TEMP_IP_LIMIT", 100),
         deny_limit=fw.getint("DENY_IP_LIMIT", 1000),
         container_mode=ct.getboolean("CONTAINER_MODE", False),
