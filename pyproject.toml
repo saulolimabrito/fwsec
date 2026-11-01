@@ -12,10 +12,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/hdbrsaulobrito/fwsec"
-Repository = "https://github.com/hdbrsaulobrito/fwsec.git"
-Issues = "https://github.com/hdbrsaulobrito/fwsec/issues"
-Security = "https://github.com/hdbrsaulobrito/fwsec/security/policy"
+Homepage = "https://github.com/saulolimabrito/fwsec"
+Repository = "https://github.com/saulolimabrito/fwsec.git"
+Issues = "https://github.com/saulolimabrito/fwsec/issues"
+Security = "https://github.com/saulolimabrito/fwsec/security/policy"
 
 [project.scripts]
 fwsec = "fwsec.cli:main"

@@ -16,4 +16,4 @@ Describe changes to firewall rules, ports, privileges, installation, or dependen
 - [ ] Documentation was updated where necessary.
 - [ ] No secrets, credentials, customer data, or internal addresses were included.
 - [ ] The change was validated in a supported environment.
-- [ ] Approval from `@hdbrsaulobrito` was requested.
+- [ ] Review by `@saulolimabrito` was requested.

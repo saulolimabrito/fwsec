@@ -11,13 +11,13 @@ fwsec is distributed and maintained as an independent project. This repository c
 No git required — the installer downloads the latest fwsec release by itself:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hdbrsaulobrito/fwsec/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/saulolimabrito/fwsec/main/install.sh | sudo bash
 ```
 
 When piped like this the install is non-interactive: detected inbound ports and safe outbound defaults are applied automatically. To answer the interactive prompts (port selection, container policy), download the installer first and run it from a terminal:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/hdbrsaulobrito/fwsec/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/saulolimabrito/fwsec/main/install.sh
 sudo bash install.sh
 ```
 
@@ -32,7 +32,7 @@ fwsec checks the GitHub repository for a newer release; when one is available it
 ## Installation from source
 
 ```bash
-git clone https://github.com/hdbrsaulobrito/fwsec.git
+git clone https://github.com/saulolimabrito/fwsec.git
 cd fwsec
 sudo bash install.sh
 ```
@@ -297,7 +297,7 @@ fwsec -c && fwsec -l
 
 ## Development and governance
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) before preparing a change. The `main` branch is protected: every change must be submitted through a pull request and requires approval from `@hdbrsaulobrito`. Direct pushes and merges without that approval are not permitted.
+See [CONTRIBUTING.md](CONTRIBUTING.md) before preparing a change. Changes are submitted through pull requests and reviewed by the project maintainer, `@saulolimabrito`.
 
 Do not disclose security vulnerabilities in public issues. Use **Security → Report a vulnerability** and follow [SECURITY.md](SECURITY.md).
 

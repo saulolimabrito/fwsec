@@ -7,7 +7,7 @@
 set -euo pipefail
 
 FWSEC_VERSION="1.1.0"
-REPO="hdbrsaulobrito/fwsec"
+REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"
 BIN="/usr/local/bin/fwsec"
@@ -466,7 +466,7 @@ install_service() {
     cat > "$SERVICE" << UNIT
 [Unit]
 Description=fwsec - nftables + CrowdSec firewall manager
-Documentation=https://github.com/hdbrsaulobrito/fwsec
+Documentation=https://github.com/saulolimabrito/fwsec
 After=network.target nftables.service crowdsec.service crowdsec-firewall-bouncer.service
 Wants=crowdsec.service crowdsec-firewall-bouncer.service
 

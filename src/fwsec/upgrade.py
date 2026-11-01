@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-REPO = "hdbrsaulobrito/fwsec"
+REPO = "saulolimabrito/fwsec"
 _TIMEOUT = 20
 
 

@@ -9,9 +9,9 @@ Contributions are accepted through pull requests. Do not push directly to `main`
 3. Run the applicable validation commands.
 4. Update the documentation whenever public behavior changes.
 5. Open a pull request describing the change, motivation, impact, and tests.
-6. Request a review from `@hdbrsaulobrito`.
+6. Merge the pull request after review.
 
-Every file is assigned to `@hdbrsaulobrito` through `CODEOWNERS`. Only that maintainer's approval satisfies the review requirement for merging into the protected branch.
+`CODEOWNERS` assigns every file to `@saulolimabrito`, the project maintainer.
 
 ## Minimum validation
 
