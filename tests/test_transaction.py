@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: GPL-2.0-only
+from __future__ import annotations
+
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from fwsec import cli, config, state, transaction
+
+
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name in ("ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "CONF_FILE"):
+            p = patch.object(config, name, self.root / name)
+            p.start()
+            self.addCleanup(p.stop)
+        for name, path in (("ROOT", "transactions"), ("LOCK", "lock"),
+                           ("LOADER_DEBIAN", "nftables.conf"),
+                           ("LOADER_RHEL", "sysconfig"), ("INCLUDE", "fwsec.nft")):
+            p = patch.object(transaction, name, self.root / path)
+            p.start()
+            self.addCleanup(p.stop)
+        self.before = {"fwsec": "", "filter_exists": False, "chains": {}, "sets": []}
+
+    def test_invalid_ports_rejected(self):
+        for ports in (["0"], ["65536"], ["100:20"], ["22; flush ruleset"], ["1:2:3"]):
+            with self.subTest(ports=ports), self.assertRaises(ValueError):
+                transaction.validate(config.FwsecConfig(tcp_in=ports), [22])
+
+    def test_invalid_ip_in_file_rejected(self):
+        config.ALLOW_FILE.write_text("not-an-ip # test\n")
+        with self.assertRaisesRegex(ValueError, "Invalid IP/CIDR"):
+            transaction.validate(config.FwsecConfig(), [22])
+
+    def test_geo_allow_requires_every_country_and_family(self):
+        with patch("fwsec.geo.country_cidrs", return_value=(["1.0.0.0/8"], [])):
+            with self.assertRaisesRegex(ValueError, "Incomplete geo"):
+                transaction.validate(config.FwsecConfig(geo_allow=["br"]), [22])
+
+    def test_bulk_lists_in_one_transaction_and_expired_temp_not_permanent(self):
+        config.ALLOW_FILE.write_text("192.0.2.1\n2001:db8::1\n")
+        config.DENY_FILE.write_text("198.51.100.1\n198.51.100.2\n")
+        temps = {
+            "198.51.100.1": state.TempEntry("198.51.100.1", "", time.time() + 200, 200),
+            "198.51.100.2": state.TempEntry("198.51.100.2", "", time.time() - 1, 200),
+        }
+        with patch("fwsec.state.load", return_value=state.State(temps, {}, {})):
+            script = transaction.build(config.FwsecConfig(), [22], self.before)
+        self.assertIn("add element inet fwsec allow4 { 192.0.2.1/32 }", script)
+        self.assertIn("198.51.100.1/32 timeout", script)
+        self.assertNotIn("198.51.100.2", script)
+        self.assertNotIn("flush ruleset", script)
+        self.assertNotIn("flush table inet filter", script)
+
+    def test_validation_failure_never_applies(self):
+        with patch.object(transaction, "check", side_effect=RuntimeError("invalid")), \
+                patch("fwsec.nft._run_script") as apply:
+            with self.assertRaises(RuntimeError):
+                transaction.apply("invalid", self.before)
+            apply.assert_not_called()
+
+    def test_atomic_apply_is_one_call(self):
+        with patch.object(transaction, "check"), patch("fwsec.nft._run_script") as apply:
+            transaction.apply("transaction", self.before)
+            apply.assert_called_once_with("transaction")
+
+    def test_foreign_chains_require_explicit_adoption(self):
+        objs = [{"table": {"name": "filter", "family": "inet"}},
+                {"chain": {"family": "inet", "table": "filter", "name": "input",
+                           "hook": "input", "type": "filter"}}]
+        with patch.object(transaction, "_objects", return_value=objs), \
+                patch.object(transaction, "_dump", return_value="snapshot"):
+            with self.assertRaisesRegex(RuntimeError, "ownership"):
+                transaction.snapshot()
+            self.assertEqual(transaction.snapshot(adopt=True)["chains"], {"input": "snapshot"})
+
+    def test_adoption_still_refuses_non_base_chains(self):
+        objs = [{"chain": {"family": "inet", "table": "filter", "name": "input"}}]
+        with patch.object(transaction, "_objects", return_value=objs):
+            with self.assertRaisesRegex(RuntimeError, "base chain"):
+                transaction.snapshot(adopt=True)
+
+    def test_rollback_is_scoped(self):
+        objs = [{"table": {"name": "fwsec", "family": "inet"}},
+                {"chain": {"family": "inet", "table": "filter", "name": "input"}},
+                {"chain": {"family": "inet", "table": "libvirt", "name": "forward"}}]
+        before = dict(self.before, fwsec="table inet fwsec {}\n",
+                      chains={"input": "table inet filter { chain input {} }"})
+        with patch.object(transaction, "_objects", return_value=objs):
+            script = transaction.restore_script(before)
+        self.assertIn("delete table inet fwsec", script)
+        self.assertIn("delete chain inet filter input", script)
+        self.assertNotIn("libvirt", script)
+        self.assertNotIn("flush ruleset", script)
+        self.assertNotIn("flush table inet filter", script)
+
+    def test_persistence_preserves_foreign_loader_includes(self):
+        transaction.LOADER_RHEL.write_text('include "management.nft"\n')
+        _, content = transaction.loader_content()
+        self.assertIn('include "management.nft"', content)
+        self.assertIn(str(transaction.INCLUDE), content)
+
+    def test_legacy_managed_loader_loses_global_flush(self):
+        transaction.LOADER_DEBIAN.write_text("# Managed by fwsec\nflush ruleset\nold rules")
+        _, content = transaction.loader_content()
+        self.assertNotIn("flush ruleset", content)
+        self.assertNotIn("old rules", content)
+
+    def test_foreign_global_flush_is_not_overwritten(self):
+        transaction.LOADER_DEBIAN.write_text("flush ruleset\n")
+        with self.assertRaisesRegex(RuntimeError, "administrator-owned"):
+            transaction.loader_content()
+        self.assertEqual(transaction.LOADER_DEBIAN.read_text(), "flush ruleset\n")
+
+    def test_restore_files_and_permissions(self):
+        transaction.INCLUDE.write_text("previous")
+        transaction.INCLUDE.chmod(0o640)
+        saved = {"files": transaction.snapshot_files()}
+        transaction.INCLUDE.write_text("new")
+        transaction.LOADER_DEBIAN.write_text("new file")
+        transaction.restore_files(saved)
+        self.assertEqual(transaction.INCLUDE.read_text(), "previous")
+        self.assertEqual(transaction.INCLUDE.stat().st_mode & 0o777, 0o640)
+        self.assertFalse(transaction.LOADER_DEBIAN.exists())
+
+    def trial(self, expired=False):
+        ident = "a" * 32
+        directory = transaction.ROOT / ident
+        directory.mkdir(parents=True)
+        (directory / "pending").write_text(str(time.monotonic() + (-1 if expired else 100)))
+        (directory / "applied").write_text("yes")
+        (directory / "before.json").write_text(json.dumps(self.before))
+        return ident, directory
+
+    def test_pending_trial_excludes_writers(self):
+        self.trial()
+        with self.assertRaisesRegex(RuntimeError, "pending"):
+            transaction.require_no_pending()
+
+    def test_confirm_persists_then_cancels_rollback(self):
+        ident, directory = self.trial()
+        with patch.object(transaction, "persist"), patch("fwsec.config.set_enabled"):
+            transaction.confirm(ident)
+        self.assertTrue((directory / "confirmed").exists())
+        self.assertFalse((directory / "pending").exists())
+
+    def test_persist_failure_keeps_rollback_armed(self):
+        ident, directory = self.trial()
+        with patch.object(transaction, "persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                transaction.confirm(ident)
+        self.assertTrue((directory / "pending").exists())
+
+    def test_expired_confirmation_rejected(self):
+        ident, _ = self.trial(expired=True)
+        with self.assertRaisesRegex(RuntimeError, "deadline"):
+            transaction.confirm(ident)
+
+    def test_watchdog_restores_after_deadline(self):
+        ident, directory = self.trial(expired=True)
+        with patch.object(transaction, "restore_script", return_value="restore"), \
+                patch.object(transaction, "check"), patch.object(transaction, "restore_files"), \
+                patch("fwsec.nft._run_script") as apply:
+            transaction.watchdog(ident)
+        apply.assert_called_once_with("restore")
+        self.assertTrue((directory / "rolled-back").exists())
+
+    def test_no_watchdog_means_no_apply(self):
+        with patch.object(transaction, "check"), patch("subprocess.Popen", return_value=Mock()), \
+                patch("time.sleep"), patch("fwsec.nft._run_script") as apply:
+            with self.assertRaisesRegex(RuntimeError, "worker did not start"):
+                transaction.apply("new", self.before, 120)
+        apply.assert_not_called()
+        self.assertFalse(transaction.pending())
+
+    def test_restart_does_not_flush_first(self):
+        with patch.object(cli, "_require_root"), patch.object(cli, "cmd_start") as start, \
+                patch("fwsec.nft.flush_table") as flush:
+            cli.cmd_restart(Mock())
+        start.assert_called_once()
+        flush.assert_not_called()
+
+    def test_safe_commands_are_mutually_exclusive(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--apply-safe", "--timeout", "90", "--adopt-legacy"])
+        self.assertTrue(args.apply_safe)
+        self.assertTrue(args.adopt_legacy)
+        self.assertEqual(args.timeout, 90)
+        self.assertEqual(parser.parse_args(["--confirm", "a" * 32]).confirm, "a" * 32)
+
+
+if __name__ == "__main__":
+    unittest.main()

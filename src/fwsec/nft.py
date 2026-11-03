@@ -36,8 +36,10 @@ MIN_NFT_VERSION = (0, 9, 0)
 
 def _run(*args: str, check: bool = False) -> tuple[int, str, str]:
     try:
-        r = subprocess.run(["nft", *args], capture_output=True, text=True)
-    except (OSError, subprocess.SubprocessError):
+        r = subprocess.run(["nft", *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        if check:
+            raise RuntimeError(f"nft unavailable or timed out: {exc}") from exc
         return 127, "", "nft binary is not available"
     if check and r.returncode != 0:
         raise RuntimeError(f"nft {' '.join(args)}: {r.stderr.strip()}")
@@ -46,7 +48,8 @@ def _run(*args: str, check: bool = False) -> tuple[int, str, str]:
 
 def _run_script(script: str, check: bool = True) -> tuple[int, str, str]:
     try:
-        r = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True, text=True)
+        r = subprocess.run(["nft", "-f", "-"], input=script, capture_output=True,
+                           text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         if check:
             raise RuntimeError(f"nft is not available: {e}")

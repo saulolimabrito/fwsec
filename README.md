@@ -41,6 +41,57 @@ sudo bash install.sh
 
 ## Updating
 
+### Safe rule application (development)
+
+Rule reloads now validate configuration, compile all fwsec rules and set
+elements, run `nft --check`, and apply one nftables transaction. A rejected
+transaction does not partially change the live firewall. Concurrent fwsec
+writers are serialized by a root-owned lock; writers are refused during a
+pending safe apply.
+
+```bash
+sudo fwsec --dry-run                  # validate/print; no rules/configuration changed
+sudo fwsec --apply-safe --timeout 120 # trial; do NOT close your original SSH session
+# Open a NEW SSH connection and confirm the ID printed by the command:
+sudo fwsec --confirm TRANSACTION_ID
+```
+
+Without confirmation the detached watchdog restores the previous fwsec
+table and affected filter chains. The watchdog is independent of the SSH
+terminal and does not require systemd (also works on OpenRC). It is not a
+reboot/power-loss recovery service: do not reboot or upgrade during a trial.
+Snapshots, confirmation/rollback status and worker logs are retained in
+`/var/lib/fwsec/transactions/<ID>/`. A failed rollback is recorded in
+`rollback-error`, retried, and continues to block other fwsec writers.
+
+**Ownership and existing installations:** only `inet fwsec` and the marked
+`input`, `forward`, `output` base chains of `inet filter` are managed. Other
+tables/chains and existing CrowdSec sets/elements are not flushed. The shared
+filter table itself is never flushed. Old installations lack ownership
+markers: inspect them first, then deliberately adopt only if those objects
+really belong to fwsec:
+
+```bash
+sudo fwsec --dry-run --adopt-legacy
+sudo fwsec --apply-safe --adopt-legacy --timeout 120
+```
+
+Do not use adoption to overwrite a third-party firewall. This development
+change intentionally refuses an unattended reload of unmarked legacy rules;
+it must be tested and adopted before a production upgrade can be released.
+
+Boot persistence uses `/etc/nftables/fwsec.nft`, included by the distro's
+loader, with scoped/idempotent commands instead of `flush ruleset`. Existing
+administrator includes are kept. An administrator-owned loader containing a
+global flush is refused before applying rules and must be reviewed manually.
+Safe applies defer persistence until confirmation; persistence failure keeps
+rollback armed. Rollback also restores persistence/config files as captured
+at invocation (not configuration edits the operator made before invocation).
+
+Local unit tests use mocks; the separate Linux CI job runs real nftables
+only inside a disposable network namespace, including a watchdog test after
+the launching process exits. No production server is used for these tests.
+
 ```bash
 sudo fwsec --upgrade
 ```
