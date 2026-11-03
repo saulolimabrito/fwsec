@@ -27,6 +27,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "ENABLED": "1",
         "TCP_IN": "1157",
         "TCP_OUT": "80,443,53,25,587,993,995",
+        "OUTPUT_POLICY": "accept",
         "UDP_IN": "53",
         "UDP_OUT": "53,123",
         "ICMP_IN": "1",
@@ -60,6 +61,7 @@ class FwsecConfig:
     enabled: bool = True
     tcp_in: list[str] = field(default_factory=list)
     tcp_out: list[str] = field(default_factory=list)
+    output_policy: str = "accept"
     udp_in: list[str] = field(default_factory=list)
     udp_out: list[str] = field(default_factory=list)
     icmp_in: bool = True
@@ -97,6 +99,7 @@ def load_config() -> FwsecConfig:
         enabled=fw.getboolean("ENABLED", True),
         tcp_in=_parse_ports(fw.get("TCP_IN", "")),
         tcp_out=_parse_ports(fw.get("TCP_OUT", "")),
+        output_policy=fw.get("OUTPUT_POLICY", "accept").strip().lower(),
         udp_in=_parse_ports(fw.get("UDP_IN", "")),
         udp_out=_parse_ports(fw.get("UDP_OUT", "")),
         icmp_in=fw.getboolean("ICMP_IN", True),

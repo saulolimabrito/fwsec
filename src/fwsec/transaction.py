@@ -64,6 +64,8 @@ def validate(c: config.FwsecConfig, ssh_ports: list[int]) -> None:
         raise ValueError("No valid SSH listening port detected.")
     if c.container_policy not in ("open", "filtered"):
         raise ValueError("CONTAINER_POLICY must be open or filtered.")
+    if c.output_policy not in ("accept", "drop"):
+        raise ValueError("OUTPUT_POLICY must be accept or drop.")
     for cc in c.geo_allow + c.geo_block:
         if not re.fullmatch(r"[a-z]{2}", cc):
             raise ValueError(f"Invalid country code: {cc!r}")

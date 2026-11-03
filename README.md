@@ -128,8 +128,11 @@ During installation, the installer scans the system with `ss` and lists every se
 - **Outbound UDP** — suggests `53,123,443` (DNS, NTP, QUIC/HTTP3).
 
 Legacy mode retains its existing OUTPUT ACCEPT behavior: these outbound
-lists are not an egress deny-by-default policy. In inherited-policy mode the
-original IPv4/IPv6 OUTPUT policies and ordered egress rules are enforced.
+lists are not an egress deny-by-default policy unless `OUTPUT_POLICY = drop`
+is explicitly set. That opt-in mode keeps loopback, established/related
+replies and ICMP/ICMPv6 control traffic permitted and restricts new TCP/UDP
+egress to TCP_OUT/UDP_OUT. In inherited-policy mode the original IPv4/IPv6
+OUTPUT policies and ordered egress rules are authoritative instead.
 
 At each prompt, press Enter to accept the suggestion, type a comma-separated list (ranges like `8000:8080` are allowed), or type `none`. The choices are written to `/etc/fwsec/fwsec.conf`. In non-interactive shells the detected inbound ports and the safe outbound defaults are applied automatically. If `fwsec.conf` already exists, the installer asks before reconfiguring ports.
 

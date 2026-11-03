@@ -324,6 +324,8 @@ def cmd_check(_args: argparse.Namespace) -> None:
     # TCP_IN ports
     _ok(f"TCP_IN  : {', '.join(c.tcp_in) or '(none)'}")
     _ok(f"TCP_OUT : {', '.join(c.tcp_out) or '(none)'}")
+    _ok("OUTPUT policy: " + ("per-family inherited policy" if c.inherited_policy
+                              else c.output_policy.upper()))
 
     # Allow/deny files
     allow_list = cfg.read_allow()
@@ -424,6 +426,9 @@ def cmd_list(_args: argparse.Namespace) -> None:
     print(f"  {CYAN}TCP IN {RESET} : {', '.join(str(p) for p in ssh_ports)} (SSH)"
           f"{', ' + _ports(c.tcp_in) if c.tcp_in else ''}")
     print(f"  {CYAN}TCP OUT{RESET} : {_ports(c.tcp_out)}")
+    print(f"  {CYAN}OUTPUT POLICY{RESET}: " + (
+        "inherited (see report)" if c.inherited_policy else c.output_policy.upper()
+    ))
     print(f"  {CYAN}UDP IN {RESET} : {_ports(c.udp_in)}")
     print(f"  {CYAN}UDP OUT{RESET} : {_ports(c.udp_out)}")
     print(f"  {CYAN}ICMP IN{RESET} : {'yes' if c.icmp_in else 'no'}")

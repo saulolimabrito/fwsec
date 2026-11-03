@@ -156,6 +156,20 @@ class MigrationTests(unittest.TestCase):
     def test_legacy_default_config_unchanged(self):
         self.assertIn("policy accept", rules.generate_filter_table(config.FwsecConfig(), [22]))
 
+    def test_explicit_output_drop_preserves_replies_and_loopback(self):
+        c = config.FwsecConfig(output_policy="drop", tcp_out=["443"], udp_out=["53"])
+        transaction.validate(c, [22])
+        text = rules.generate_filter_table(c, [22]).split("chain output {")[1]
+        self.assertIn("policy drop;", text)
+        self.assertIn('oifname "lo" accept', text)
+        self.assertIn("ct state established,related accept", text)
+        self.assertIn("tcp dport { 443 }", text)
+        self.assertIn("udp dport { 53 }", text)
+
+    def test_invalid_output_policy_rejected_before_apply(self):
+        with self.assertRaisesRegex(ValueError, "OUTPUT_POLICY"):
+            transaction.validate(config.FwsecConfig(output_policy="reject"), [22])
+
     def test_inherited_policy_uses_own_chains_not_global_ports(self):
         doc = policy(v6="-A ufw-user-input -p tcp --dport 8443 -j ACCEPT")
         with tempfile.TemporaryDirectory() as tmp:

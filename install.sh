@@ -578,11 +578,13 @@ detect_migration_source() {
         MIGRATION_SOURCES="csf"
     fi
     if command -v "$UFW_BIN" &>/dev/null && \
-       "$UFW_BIN" status 2>/dev/null | grep -q "^Status: active"; then
+       { "$UFW_BIN" status 2>/dev/null | grep -q "^Status: active" || \
+         grep -qE '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; }; then
         MIGRATION_SOURCES="${MIGRATION_SOURCES:+${MIGRATION_SOURCES} }ufw"
     fi
     if command -v firewall-cmd &>/dev/null && \
-       firewall-cmd --state 2>/dev/null | grep -q running; then
+       { firewall-cmd --state 2>/dev/null | grep -q running || \
+         systemctl is-enabled --quiet firewalld 2>/dev/null; }; then
         MIGRATION_SOURCES="${MIGRATION_SOURCES:+${MIGRATION_SOURCES} }firewalld"
     fi
     if [[ -n "$MIGRATION_SOURCES" ]]; then

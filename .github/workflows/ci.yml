@@ -19,10 +19,12 @@ jobs:
       - name: Verify live migration parity with real IPv4 and IPv6 packets
         run: |
           set -o pipefail
-          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/migration_sandbox.py 2>&1 | tee /tmp/migration-test.log || {
-            echo "::error::$(tail -n 14 /tmp/migration-test.log | tr '\n' ' ')"
-            exit 1
-          }
+          for source in ufw csf; do
+            sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/migration_sandbox.py --source "$source" 2>&1 | tee /tmp/migration-test.log || {
+              echo "::error::$(tail -n 14 /tmp/migration-test.log | tr '\n' ' ')"
+              exit 1
+            }
+          done
 
   lint:
     name: Lint (shellcheck, ruff, mypy)

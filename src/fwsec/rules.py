@@ -87,6 +87,14 @@ table inet filter {
     mark_accept = f"meta mark {WHITELIST_MARK_VALUE} accept" if cfg.whitelist_mark else ""
     bypass_input = f"        {mark_accept}\n" if cfg.whitelist_mark else ""
     bypass_forward = f"\n        {mark_accept}" if cfg.whitelist_mark else ""
+    output_safety = ""
+    if cfg.output_policy == "drop":
+        output_safety = '''
+        oifname "lo" accept
+        ct state established,related accept
+        ip protocol icmp accept
+        meta l4proto ipv6-icmp accept
+'''
 
     # Container mode: the forward chain must stay permissive so container
     # networking (Docker/Podman NAT) keeps working. CrowdSec bans still apply
@@ -160,7 +168,8 @@ table inet filter {{
 {forward_chain}
 
     chain output {{
-        type filter hook output priority filter; policy accept;
+        type filter hook output priority filter; policy {cfg.output_policy};
+{output_safety}
 
         # Outbound TCP
         {tcp_out_rule}
