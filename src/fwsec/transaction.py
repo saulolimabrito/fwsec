@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fwsec import config, geo, nft, rules, state
+from fwsec import config, geo, migration, nft, rules, state
 
 ROOT = Path("/var/lib/fwsec/transactions")
 LOCK = Path("/run/fwsec.lock")
@@ -51,6 +51,8 @@ def require_no_pending() -> None:
 
 def validate(c: config.FwsecConfig, ssh_ports: list[int]) -> None:
     config.geo_mode(c)
+    if c.inherited_policy:
+        migration.load(c.inherited_policy)
     for name in ("tcp_in", "tcp_out", "udp_in", "udp_out"):
         for token in getattr(c, name):
             if not re.fullmatch(r"\d+(?::\d+)?", token):
@@ -274,7 +276,10 @@ def loader_content() -> tuple[Path, str]:
     if PERSIST_MARKER in content:
         # Replace an old fwsec-generated wholesale snapshot, including its
         # destructive flush ruleset, with a scoped include.
+        includes = [line for line in content.splitlines()
+                    if re.match(r"^\s*include\s+", line) and str(INCLUDE) not in line]
         content = "#!/usr/sbin/nft -f\n" + PERSIST_MARKER + "\n"
+        content += "\n".join(includes) + ("\n" if includes else "")
     elif re.search(r"(?m)^\s*flush\s+ruleset\b", content):
         raise RuntimeError(
             f"{loader} is administrator-owned and contains 'flush ruleset'. "
@@ -288,7 +293,8 @@ def loader_content() -> tuple[Path, str]:
 
 def snapshot_files() -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE):
+    for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE,
+                 config.MIGRATION_RECEIPT):
         result[str(path)] = ({"text": path.read_text(), "mode": path.stat().st_mode & 0o777}
                              if path.exists() else None)
     return result
@@ -334,9 +340,19 @@ def confirm(ident: str) -> None:
         raise RuntimeError("Transaction is not awaiting confirmation.")
     if time.monotonic() >= float(marker.read_text()):
         raise RuntimeError("Confirmation deadline expired; rollback is pending.")
+    candidate = directory / "migration.json"
+    receipt = None
+    if candidate.exists():
+        receipt = json.loads(candidate.read_text())
+        candidate_digest = migration.fingerprint(json.loads(Path(receipt["path"]).read_text()))
+        if candidate_digest != receipt["digest"]:
+            raise RuntimeError("Inherited policy changed during the trial; rollback remains armed.")
+        receipt["kernel_digest"] = migration.active_digest(migration.load(Path(receipt["path"])))
     # Keep pending until persistence succeeds: a write failure must still rollback.
     persist()
     config.set_enabled(True)
+    if receipt:
+        atomic_write(config.MIGRATION_RECEIPT, json.dumps(receipt))
     marker.rename(directory / "confirmed")
 
 

@@ -32,6 +32,10 @@ die()  { err "$*"; exit 1; }
 # Initial checks
 # =============================================================================
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo bash install.sh"
+if [[ -d /var/lib/fwsec/transactions ]] && \
+   [[ -n "$(find /var/lib/fwsec/transactions -mindepth 2 -maxdepth 2 -name pending -print -quit)" ]]; then
+    die "A safe apply is pending: confirm it or wait for rollback before installation/upgrade."
+fi
 
 # =============================================================================
 # Downloads with curl or wget (minimal distros ship only one of them)
@@ -586,218 +590,61 @@ detect_migration_source() {
     fi
 }
 
-# merge_port_lists "22,25" "20,110" -> "22,25,20,110" (dedup, order kept,
-# range tokens like 7770:7800 pass through untouched)
-merge_port_lists() {
-    awk -v a="$1" -v b="$2" 'BEGIN {
-        n = split(a "," b, p, ",")
-        for (i = 1; i <= n; i++) {
-            t = p[i]; gsub(/[[:space:]]/, "", t)
-            if (t ~ /^[0-9]+(:[0-9]+)?$/ && !(t in seen)) { seen[t] = 1; out = out sep t; sep = "," }
-        }
-        print out
-    }'
-}
-
 migration_backup() {
-    MIGRATION_BACKUP="${FWSEC_BACKUP_ROOT:-/root}/fwsec-migration-$(date +%Y%m%d%H%M%S)"
-    mkdir -p "$MIGRATION_BACKUP"
+    MIGRATION_BACKUP=$(mktemp -d "${FWSEC_BACKUP_ROOT:-/root}/fwsec-migration-$(date +%Y%m%d%H%M%S).XXXXXX")
+    chmod 700 "$MIGRATION_BACKUP"
     if [[ "$MIGRATION_SOURCES" == *csf* ]]; then
-        tar czf "$MIGRATION_BACKUP/csf-etc.tar.gz" "$CSF_DIR" 2>/dev/null || true
+        tar czf "$MIGRATION_BACKUP/csf-etc.tar.gz" "$CSF_DIR" 2>/dev/null || die "CSF backup failed; migration refused."
     fi
-    iptables-save > "$MIGRATION_BACKUP/iptables.rules" 2>/dev/null || true
-    ip6tables-save > "$MIGRATION_BACKUP/ip6tables.rules" 2>/dev/null || true
-    nft -s list ruleset > "$MIGRATION_BACKUP/nftables.ruleset" 2>/dev/null || true
+    iptables-save > "$MIGRATION_BACKUP/iptables.rules" || die "IPv4 backup failed; migration refused."
+    ip6tables-save > "$MIGRATION_BACKUP/ip6tables.rules" || die "IPv6 backup failed; migration refused."
+    nft -s list ruleset > "$MIGRATION_BACKUP/nftables.ruleset" || die "nft backup failed; migration refused."
+    chmod 600 "${MIGRATION_BACKUP}"/*
     ok "Pre-migration backup: ${MIGRATION_BACKUP}"
-}
-
-migrate_csf() {
-    local conf="${CSF_DIR}/csf.conf"
-    MIG_TCP_IN=$(sed -n -E 's/^TCP_IN[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    MIG_TCP_OUT=$(sed -n -E 's/^TCP_OUT[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    MIG_UDP_IN=$(sed -n -E 's/^UDP_IN[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    MIG_UDP_OUT=$(sed -n -E 's/^UDP_OUT[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    local tcp6 udp6
-    tcp6=$(sed -n -E 's/^TCP6_IN[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    udp6=$(sed -n -E 's/^UDP6_IN[[:space:]]*=[[:space:]]*"?([^"]*)"?$/\1/p' "$conf")
-    # fwsec rules are family-agnostic (inet): union v4+v6 inbound lists so
-    # nothing reachable today becomes unreachable.
-    MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "$tcp6")
-    MIG_UDP_IN=$(merge_port_lists "$MIG_UDP_IN" "$udp6")
-    MIG_ALLOW_SRC="${CSF_DIR}/csf.allow"
-    MIG_DENY_SRC="${CSF_DIR}/csf.deny"
-    MIG_ALLOW_COUNT=$(grep -cvE '^\s*#|^\s*$|^Include:' "${MIG_ALLOW_SRC}" 2>/dev/null || echo 0)
-    MIG_DENY_COUNT=$(grep -cvE '^\s*#|^\s*$|^Include:' "${MIG_DENY_SRC}" 2>/dev/null || echo 0)
-    MIG_CC_SETS=$(ipset list -name 2>/dev/null | grep -c '^cc_' || true)
-    MIGRATION_SUMMARY+=("Source         : CSF (${CSF_DIR})")
-    [[ -n "$MIG_TCP_IN" ]] && MIGRATION_SUMMARY+=("TCP_IN         : ${MIG_TCP_IN} (v4+v6 union)")
-    [[ -n "$MIG_TCP_OUT" ]] && MIGRATION_SUMMARY+=("TCP_OUT        : ${MIG_TCP_OUT}")
-    [[ -n "$MIG_UDP_IN" ]] && MIGRATION_SUMMARY+=("UDP_IN         : ${MIG_UDP_IN} (v4+v6 union)")
-    [[ -n "$MIG_UDP_OUT" ]] && MIGRATION_SUMMARY+=("UDP_OUT        : ${MIG_UDP_OUT}")
-    [[ "$MIG_ALLOW_COUNT" -gt 0 ]] && MIGRATION_SUMMARY+=("Allow list     : ${MIG_ALLOW_COUNT} IPs (comments preserved)")
-    [[ "$MIG_DENY_COUNT" -gt 0 ]] && MIGRATION_SUMMARY+=("Deny list      : ${MIG_DENY_COUNT} entries")
-    [[ "${MIG_CC_SETS:-0}" -gt 0 ]] && MIGRATION_SUMMARY+=("NOT inherited  : ${MIG_CC_SETS} country ipsets — set GEO_BLOCK and run 'fwsec --geo-update'")
-    MIGRATION_SUMMARY+=("NOT inherited  : ICMP rate limits (fwsec accepts or drops ICMP, no rate limit)")
-}
-
-migrate_ufw() {
-    local status
-    status=$("$UFW_BIN" status 2>/dev/null || true)
-    local tcp udp
-    tcp=$(grep -E 'ALLOW IN' <<< "$status" | grep '/tcp' | grep -oE '^[^ ]+' | cut -d/ -f1 | sort -u | paste -sd, -)
-    udp=$(grep -E 'ALLOW IN' <<< "$status" | grep '/udp' | grep -oE '^[^ ]+' | cut -d/ -f1 | sort -u | paste -sd, -)
-    MIG_TCP_IN="$tcp"
-    MIG_UDP_IN="$udp"
-    MIG_ALLOW_COUNT=0
-    MIG_DENY_COUNT=0
-    MIGRATION_SUMMARY+=("Source         : UFW (active)")
-    [[ -n "$MIG_TCP_IN" ]] && MIGRATION_SUMMARY+=("TCP_IN         : ${MIG_TCP_IN}")
-    [[ -n "$MIG_UDP_IN" ]] && MIGRATION_SUMMARY+=("UDP_IN         : ${MIG_UDP_IN}")
-    if grep -qE 'DENY IN|REJECT IN' <<< "$status"; then
-        MIGRATION_SUMMARY+=("NOT inherited  : UFW per-rule DENY/REJECT entries (fwsec.deny is manual)")
-    fi
-}
-
-migrate_firewalld() {
-    local zones port_tokens svc z p proto port
-    zones=$(firewall-cmd --get-active-zones 2>/dev/null | awk '{print $1}' | sort -u)
-    port_tokens=""
-    local unmapped=""
-    for z in $zones; do
-        port_tokens+=" $(firewall-cmd --zone "$z" --list-ports 2>/dev/null)"
-        svc+=" $(firewall-cmd --zone "$z" --list-services 2>/dev/null)"
-    done
-    for p in $port_tokens; do
-        proto="${p##*/}"; port="${p%/*}"
-        [[ "$proto" == "tcp" ]] && MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "$port")
-        [[ "$proto" == "udp" ]] && MIG_UDP_IN=$(merge_port_lists "$MIG_UDP_IN" "$port")
-    done
-    # Common firewalld services -> ports (everything else is reported)
-    local s
-    for s in $svc; do
-        case "$s" in
-            ssh) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "22") ;;
-            http|httpd) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "80") ;;
-            https) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "443") ;;
-            smtp) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "25") ;;
-            smtps) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "465") ;;
-            submission) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "587") ;;
-            pop3) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "110") ;;
-            pop3s) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "995") ;;
-            imap) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "143") ;;
-            imaps) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "993") ;;
-            dns) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "53"); MIG_UDP_IN=$(merge_port_lists "$MIG_UDP_IN" "53") ;;
-            ftp) MIG_TCP_IN=$(merge_port_lists "$MIG_TCP_IN" "21") ;;
-            ntp) MIG_UDP_IN=$(merge_port_lists "$MIG_UDP_IN" "123") ;;
-            dhcp) MIG_UDP_IN=$(merge_port_lists "$MIG_UDP_IN" "67") ;;
-            *) unmapped+="$s " ;;
-        esac
-    done
-    MIG_ALLOW_COUNT=0
-    MIG_DENY_COUNT=0
-    MIGRATION_SUMMARY+=("Source         : firewalld (zones: ${zones})")
-    [[ -n "$MIG_TCP_IN" ]] && MIGRATION_SUMMARY+=("TCP_IN         : ${MIG_TCP_IN}")
-    [[ -n "$MIG_UDP_IN" ]] && MIGRATION_SUMMARY+=("UDP_IN         : ${MIG_UDP_IN}")
-    [[ -n "${unmapped// /}" ]] && MIGRATION_SUMMARY+=("NOT inherited  : firewalld services not mapped: ${unmapped}")
-    MIGRATION_SUMMARY+=("NOT inherited  : firewalld rich rules / masquerade / forwarding")
-}
-
-run_migration_stage() {
-    [[ -n "$MIGRATION_SOURCES" ]] || return 0
-
-    if [[ -f "${CONFIG_DIR}/fwsec.conf" ]]; then
-        MIGRATION_SUMMARY+=("fwsec config already present — kept as-is (no rule merge)")
-        MIGRATION_SUMMARY+=("Previous firewall will still be removed after fwsec starts.")
-        MIGRATION_STAGED=1
-        return 0
-    fi
-
-    if [[ -t 0 ]]; then
-        local answer=""
-        echo ""
-        read -r -p "$(echo -e "  ${BOLD}Migrate existing firewall rules to fwsec?${NC} [Y/n]: ")" answer || answer=""
-        if [[ "${answer,,}" == "n" || "${answer,,}" == "no" ]]; then
-            info "Skipping rule migration — the previous firewall will still be removed after fwsec starts."
-            MIGRATION_STAGED=1
-            return 0
-        fi
-    else
-        info "Non-interactive shell: migrating existing rules automatically."
-    fi
-
-    migration_backup
-
-    if [[ "$MIGRATION_SOURCES" == *csf* ]]; then
-        migrate_csf
-    elif [[ "$MIGRATION_SOURCES" == *firewalld* ]]; then
-        migrate_firewalld
-    elif [[ "$MIGRATION_SOURCES" == *ufw* ]]; then
-        migrate_ufw
-    fi
-
-    # Stage fwsec.conf from the bundled template with the inherited ports —
-    # install_config_files() preserves files that already exist.
-    mkdir -p "$CONFIG_DIR"
-    cp "${SCRIPT_DIR}/etc/fwsec/fwsec.conf" "${CONFIG_DIR}/fwsec.conf"
-    [[ -n "${MIG_TCP_IN:-}" ]] && set_conf_value "TCP_IN" "$MIG_TCP_IN"
-    [[ -n "${MIG_TCP_OUT:-}" ]] && set_conf_value "TCP_OUT" "$MIG_TCP_OUT"
-    [[ -n "${MIG_UDP_IN:-}" ]] && set_conf_value "UDP_IN" "$MIG_UDP_IN"
-    [[ -n "${MIG_UDP_OUT:-}" ]] && set_conf_value "UDP_OUT" "$MIG_UDP_OUT"
-
-    # Allow/deny lists: copy when the source has entries (formats are
-    # comment-compatible: "IP  # comment")
-    [[ -n "${MIG_ALLOW_SRC:-}" && "$MIG_ALLOW_COUNT" -gt 0 ]] && \
-        grep -vE '^\s*#|^\s*$|^Include:' "${MIG_ALLOW_SRC}" > "${CONFIG_DIR}/fwsec.allow"
-    [[ -n "${MIG_DENY_SRC:-}" && "$MIG_DENY_COUNT" -gt 0 ]] && \
-        grep -vE '^\s*#|^\s*$|^Include:' "${MIG_DENY_SRC}" > "${CONFIG_DIR}/fwsec.deny"
-
-    chmod 750 "$CONFIG_DIR"
-    chmod 640 "${CONFIG_DIR}"/fwsec.conf "${CONFIG_DIR}"/fwsec.allow "${CONFIG_DIR}"/fwsec.deny 2>/dev/null || true
-
-    MIGRATION_STAGED=1
-    ok "Inherited rules staged in ${CONFIG_DIR} (applied when fwsec starts)."
-}
-
-remove_csf() {
-    info "Removing CSF (rules already inherited)..."
-    systemctl stop lfd csf 2>/dev/null || true
-    systemctl disable lfd csf 2>/dev/null || true
-    local cron_f
-    for cron_f in csf-cron lfd-cron csf_update; do
-        rm -f "/etc/cron.d/${cron_f}"
-    done
-    # Flush the CSF iptables rules (legacy or nft backend, both families)
-    iptables -P INPUT ACCEPT 2>/dev/null || true
-    iptables -P FORWARD ACCEPT 2>/dev/null || true
-    iptables -P OUTPUT ACCEPT 2>/dev/null || true
-    iptables -F 2>/dev/null || true
-    iptables -X 2>/dev/null || true
-    ip6tables -P INPUT ACCEPT 2>/dev/null || true
-    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
-    ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
-    ip6tables -F 2>/dev/null || true
-    ip6tables -X 2>/dev/null || true
-    if [[ -x "${CSF_DIR}/uninstall.sh" ]]; then
-        bash "${CSF_DIR}/uninstall.sh" >/dev/null 2>&1 || true
-    fi
-    rm -rf "$CSF_DIR" /var/lib/csf 2>/dev/null || true
-    rm -f /etc/init.d/csf /etc/init.d/lfd 2>/dev/null || true
-    ok "CSF removed (backup: ${MIGRATION_BACKUP:-none})."
 }
 
 remove_migrated_firewall() {
     [[ "$MIGRATION_STAGED" -eq 1 ]] || return 0
-    # Safety gate: only retire the previous firewall once fwsec is filtering.
-    if ! nft list table inet fwsec &>/dev/null; then
-        err "fwsec table is not loaded — keeping the previous firewall in place."
-        err "Fix fwsec, then re-run this installer to complete the migration."
-        return 1
+    MIGRATION_SUMMARY+=("Old firewall   : kept active during the trial; NOT uninstalled")
+    MIGRATION_SUMMARY+=("Next           : confirm from a NEW SSH session, then fwsec --migration-finalize")
+}
+
+run_migration_stage() {
+    if [[ -z "$MIGRATION_SOURCES" ]]; then
+        if ! command -v fwsec &>/dev/null; then
+            if iptables-save 2>/dev/null | grep '^-A ' >/dev/null; then
+                die "Unidentified existing iptables rules: refuse automatic replacement."
+            fi
+            if nft list ruleset 2>/dev/null | grep -E 'hook (input|output|forward)' >/dev/null; then
+                die "Unidentified existing nftables hooks: inspect ownership before installation."
+            fi
+        fi
+        return 0
     fi
-    if [[ "$MIGRATION_SOURCES" == *csf* ]]; then
-        remove_csf
+    [[ "$MIGRATION_SOURCES" != *" "* ]] || die "Multiple active firewalls: migration refused, none disabled."
+    [[ ! -f "${CONFIG_DIR}/fwsec.conf" ]] || die "An fwsec config already exists: refuse implicit merging or old-firewall removal."
+    migration_backup
+    local report="${MIGRATION_BACKUP}/migration-plan.json"
+    local -a python_cmd
+    if [[ -n "$PYTHON" ]]; then
+        python_cmd=("$PYTHON")
+    else
+        python_cmd=(uv run --no-project --python 3.11)
     fi
-    # ufw/firewalld were already stopped/masked by disable_competing_firewalls
-    MIGRATION_SUMMARY+=("Old firewall   : removed after fwsec was live (zero-open-window order)")
+    if ! "${python_cmd[@]}" "${SCRIPT_DIR}/src/fwsec/migration.py" \
+            --source "$MIGRATION_SOURCES" --output "$report" --approve "${MIGRATION_APPROVE:-}"; then
+        die "Migration needs review or has unsupported rules. Report: ${report}. No old firewall was stopped."
+    fi
+    mkdir -p "$CONFIG_DIR"
+    cp "${SCRIPT_DIR}/etc/fwsec/fwsec.conf" "${CONFIG_DIR}/fwsec.conf"
+    cp "$report" "${CONFIG_DIR}/inherited.json"
+    set_conf_value "INHERITED_POLICY" "${CONFIG_DIR}/inherited.json"
+    chmod 750 "$CONFIG_DIR"
+    chmod 600 "${CONFIG_DIR}/inherited.json" "${CONFIG_DIR}/fwsec.conf"
+    MIGRATION_STAGED=1
+    MIGRATION_SUMMARY+=("Source         : ${MIGRATION_SOURCES} (exact ordered live IPv4/IPv6 policies)")
+    MIGRATION_SUMMARY+=("Full report    : ${report}; fwsec --migration-report")
+    MIGRATION_SUMMARY+=("Output policy  : inherited, not silently changed to ACCEPT")
 }
 
 migration_report() {
@@ -817,51 +664,16 @@ migration_report() {
 # Disable competing firewalls
 # =============================================================================
 disable_competing_firewalls() {
-    if [[ "$INIT_SYSTEM" != "systemd" ]]; then
-        info "Init system is not systemd: no competing firewall services to disable."
+    # Destructive service stop/uninstall scripts can flush shared rulesets.
+    # A staged migration keeps its source active until safe confirmation.
+    if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
+        info "Existing firewall retained during the safe-apply trial."
         return 0
     fi
-
-    info "Checking for competing firewalls (nftables must be managed only by fwsec)..."
-
-    # firewalld — checked on every distro, not only RHEL-family
-    if systemctl is-active --quiet firewalld 2>/dev/null || \
-       systemctl is-enabled --quiet firewalld 2>/dev/null; then
-        systemctl stop firewalld 2>/dev/null || true
-        systemctl disable firewalld 2>/dev/null || true
-        systemctl mask firewalld 2>/dev/null || true
-        ok "firewalld stopped, disabled and masked."
-    else
-        ok "firewalld is not active."
+    if [[ -n "$MIGRATION_SOURCES" ]]; then
+        die "Unstaged source firewall: refuse to disable anything."
     fi
-
-    # UFW — checked on every distro, not only Debian-family
-    if command -v ufw &>/dev/null; then
-        if ufw status 2>/dev/null | grep -q "^Status: active"; then
-            ufw --force disable >/dev/null 2>&1 || true
-            ok "UFW disabled."
-        else
-            ok "UFW is installed but not active."
-        fi
-        systemctl stop ufw 2>/dev/null || true
-        systemctl disable ufw 2>/dev/null || true
-        systemctl mask ufw 2>/dev/null || true
-    else
-        ok "UFW is not installed."
-    fi
-
-    # Legacy iptables rule restorers and SuSEfirewall2 — they would fight
-    # fwsec's ruleset at boot
-    local svc
-    for svc in iptables ip6tables netfilter-persistent SuSEfirewall2; do
-        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-            systemctl stop "$svc" 2>/dev/null || true
-            systemctl disable "$svc" 2>/dev/null || true
-            warn "${svc}.service disabled (it restored firewall rules at boot)."
-        fi
-    done
-
-    ok "nftables will be managed exclusively by fwsec."
+    return 0
 }
 
 # =============================================================================
@@ -963,8 +775,10 @@ WantedBy=multi-user.target
 UNIT
 
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable fwsec.service 2>/dev/null || true
-    ok "fwsec.service installed and enabled at boot."
+    if [[ "$MIGRATION_STAGED" -ne 1 ]]; then
+        systemctl enable fwsec.service 2>/dev/null || true
+    fi
+    ok "fwsec.service installed (boot enable is deferred during migration trials)."
 }
 
 _install_service_openrc() {
@@ -994,7 +808,7 @@ stop() {
 }
 UNIT
     chmod +x "$SERVICE_OPENRC"
-    rc-update add fwsec default 2>/dev/null || true
+    [[ "$MIGRATION_STAGED" -eq 1 ]] || rc-update add fwsec default 2>/dev/null || true
     ok "OpenRC service installed and added to the default runlevel."
 }
 
@@ -1002,6 +816,7 @@ UNIT
 # Ensure the nftables service is enabled at boot
 # =============================================================================
 enable_nftables() {
+    [[ "$MIGRATION_STAGED" -eq 0 ]] || return 0
     case "$INIT_SYSTEM" in
         systemd) systemctl enable nftables 2>/dev/null || true ;;
         openrc)  rc-update add nftables boot 2>/dev/null || true ;;
@@ -1155,7 +970,7 @@ run_upgrade() {
 
     echo ""
     info "Reloading rules with the new version..."
-    fwsec -r 2>/dev/null || true
+    fwsec -r || die "Code installed, but rule reload was refused/failed. Existing rules were not intentionally flushed; inspect before retrying."
     ok "fwsec upgraded to ${remote}. Configuration files were preserved."
     fwsec -v
     echo ""
@@ -1620,11 +1435,13 @@ main() {
     UPGRADE=0
     NO_CROWDSEC=0
     CONF_IS_NEW=0
+    MIGRATION_APPROVE=""
     for arg in "$@"; do
         case "$arg" in
             --force)       FORCE=1 ;;
             --upgrade)     UPGRADE=1 ;;
             --no-crowdsec) NO_CROWDSEC=1 ;;
+            --migration-approve=*) MIGRATION_APPROVE="${arg#*=}" ;;
         esac
     done
 
@@ -1670,14 +1487,18 @@ main() {
     install_fwsec_package
     install_config_files
     configure_ports_if_needed
-    configure_containers
+    [[ "$MIGRATION_STAGED" -eq 1 ]] || configure_containers
     configure_crowdsec_container_logs
     install_binary
     install_service
 
     echo ""
     info "Starting fwsec for the first time..."
-    if fwsec -s; then
+    local -a start_cmd=(fwsec -s)
+    if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
+        start_cmd=(fwsec --apply-safe --timeout 120)
+    fi
+    if "${start_cmd[@]}"; then
         ok "fwsec started successfully."
         remove_migrated_firewall
     else
@@ -1685,6 +1506,7 @@ main() {
         if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
             warn "The previous firewall was NOT removed (fwsec is not filtering)."
         fi
+        die "Firewall application failed; installation is NOT complete."
     fi
 
     echo ""

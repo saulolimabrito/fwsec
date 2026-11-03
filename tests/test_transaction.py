@@ -112,6 +112,14 @@ class TransactionTests(unittest.TestCase):
         self.assertNotIn("flush ruleset", content)
         self.assertNotIn("old rules", content)
 
+    def test_managed_loader_keeps_administrator_includes(self):
+        transaction.LOADER_DEBIAN.write_text(
+            '# Managed by fwsec\nflush ruleset\ninclude "management.nft"\n'
+        )
+        _, content = transaction.loader_content()
+        self.assertIn('include "management.nft"', content)
+        self.assertNotIn("flush ruleset", content)
+
     def test_foreign_global_flush_is_not_overwritten(self):
         transaction.LOADER_DEBIAN.write_text("flush ruleset\n")
         with self.assertRaisesRegex(RuntimeError, "administrator-owned"):

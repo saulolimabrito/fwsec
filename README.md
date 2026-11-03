@@ -113,7 +113,10 @@ sudo bash install.sh
 | `--force` | Performs a complete reinstallation. |
 | `--no-crowdsec` | Installs fwsec without the CrowdSec integration (CrowdSec and its nftables bouncer can be added later; every fwsec command degrades gracefully when they are absent). |
 
-The installer also detects competing firewalls — **firewalld** and **UFW** on any supported distribution, plus legacy iptables rule-restore services (`iptables.service`, `netfilter-persistent`) — and stops, disables, and masks them, so nftables is managed exclusively by fwsec. The post-installation check fails loudly if either firewall is still active.
+The installer detects CSF, UFW and firewalld before changing their policy.
+It no longer stops/masks them or runs blanket teardown scripts during
+installation. A reviewed migration keeps its source active during a safe
+trial; unsupported/ambiguous policies abort without retiring the source.
 
 ### Interactive port selection
 
@@ -122,6 +125,10 @@ During installation, the installer scans the system with `ss` and lists every se
 - **Inbound TCP / UDP** — defaults to the detected listening services. The SSH port is detected automatically and always stays open.
 - **Outbound TCP** — suggests `80,443,53,853` (HTTP, HTTPS, DNS, DNS-over-TLS).
 - **Outbound UDP** — suggests `53,123,443` (DNS, NTP, QUIC/HTTP3).
+
+Legacy mode retains its existing OUTPUT ACCEPT behavior: these outbound
+lists are not an egress deny-by-default policy. In inherited-policy mode the
+original IPv4/IPv6 OUTPUT policies and ordered egress rules are enforced.
 
 At each prompt, press Enter to accept the suggestion, type a comma-separated list (ranges like `8000:8080` are allowed), or type `none`. The choices are written to `/etc/fwsec/fwsec.conf`. In non-interactive shells the detected inbound ports and the safe outbound defaults are applied automatically. If `fwsec.conf` already exists, the installer asks before reconfiguring ports.
 
@@ -136,22 +143,62 @@ The SSH port is detected separately and always stays open in either mode.
 
 ## Migrating from CSF / UFW / firewalld
 
-The installer detects an existing firewall and inherits its rules into
-fwsec automatically — the previous firewall is only removed **after** fwsec
-is up and filtering (zero-open-window order, with a full backup under
-`/root/fwsec-migration-<timestamp>/`).
+Migration uses complete **live `iptables-save` / `ip6tables-save` snapshots**,
+not a union of configured ports or a human-readable status summary. The JSON
+intermediate model preserves IPv4/IPv6, ordered actions/jumps, source and
+destination CIDRs, input/output interfaces, protocol, port ranges,
+connection states and INPUT/OUTPUT/FORWARD default policies. Thus an IPv6
+permission does not silently open IPv4, a source-specific allowance does
+not become global, and OUTPUT DROP does not become OUTPUT ACCEPT.
 
-| Source | Inherited |
-|---|---|
-| **CSF** | `TCP_IN`/`TCP_OUT`/`UDP_IN`/`UDP_OUT` (v4+v6 union — fwsec rules are family-agnostic), `csf.allow` → `fwsec.allow`, `csf.deny` → `fwsec.deny` (comments preserved) |
-| **UFW** | ALLOW IN ports → inbound lists |
-| **firewalld** | zone ports + common services (ssh, http, https, smtp, dns, …) → inbound lists |
+```bash
+sudo fwsec --migration-plan ufw --migration-output /root/migration.json
+sudo fwsec --migration-report --migration-output /root/migration.json
+# Only after reviewing the exact ownership warnings:
+sudo fwsec --migration-plan ufw --migration-output /root/migration.json \
+  --migration-approve FINGERPRINT_FROM_REPORT
+```
 
-At the end of the installation a **migration report** lists everything
-inherited and everything intentionally not inherited (CSF country ipsets —
-use `GEO_BLOCK` + `fwsec --geo-update`, ICMP rate limits, NAT/rich rules).
-Interactive installs ask before migrating; non-interactive installs
-(`curl … | sudo bash`) migrate automatically.
+The report distinguishes translated rules, ownership requiring approval,
+and unsupported rules. Approval applies only to that exact fingerprint; it
+**cannot override unsupported semantics**. NAT, raw/mangle rules, ipsets,
+rate limits, logging/reject extensions, interface wildcards, third-party
+chains and native nftables firewalld policies are conservatively blocked,
+not dropped or guessed. This first strict adapter supports a subset of
+xtables filter policies, not arbitrary firewall configurations. An active
+firewalld daemon also requires a reviewed backend-specific retirement;
+the finalizer refuses to tear it down automatically.
+
+The installer saves config/live snapshots and the complete report under
+`/root/fwsec-migration-<timestamp>.<random>/`. If the plan is ready, it sets
+`INHERITED_POLICY = /etc/fwsec/inherited.json` and starts a **120-second safe
+trial**. Existing fwsec configurations are never implicitly merged. Multiple
+sources or unidentified active hooks/rules are refused. A source needing
+ownership approval can be retried with
+`bash install.sh --migration-approve=FINGERPRINT`; the fingerprint is rechecked.
+
+After applying a ready policy:
+
+```bash
+# From a NEW SSH session, confirm the transaction ID printed by the installer:
+sudo fwsec --confirm TRANSACTION_ID
+sudo fwsec --migration-report
+sudo fwsec --migration-finalize
+```
+
+Finalization requires the exact confirmed policy to remain active and the
+source snapshots to remain unchanged. Both retirement batches are checked
+first. Retirement uses `iptables-restore --noflush` / `ip6tables-restore
+--noflush` with exact rule deletions and only reviewed source-chain names;
+there is no global `-F`, `-X`, uninstall script or ruleset flush. Source
+startup is disabled without executing its firewall teardown (LFD is stopped;
+CSF cron entries are backed up). Packages/configs remain for recovery. A
+failure is reported, never presented as a successful complete migration.
+
+With `INHERITED_POLICY` active, that snapshot is authoritative for ports and
+directional defaults; changing legacy TCP_IN/OUT fields does not edit the
+inherited policy. CrowdSec remains an additional protection layer. The
+normal non-migration default configuration is unchanged.
 
 ## Quick reference
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import ipaddress
+import json
 import re
 import shutil
 import socket
@@ -17,7 +18,18 @@ import sys
 import time
 from pathlib import Path
 
-from fwsec import __version__, containers, crowdsec, geo, nft, rules, state, transaction, upgrade
+from fwsec import (
+    __version__,
+    containers,
+    crowdsec,
+    geo,
+    migration,
+    nft,
+    rules,
+    state,
+    transaction,
+    upgrade,
+)
 from fwsec import config as cfg
 
 # ---------------------------------------------------------------------------
@@ -187,6 +199,12 @@ def cmd_start(_args: argparse.Namespace) -> None:
 
     ssh_ports = _detect_ssh_ports()
     transaction.validate(c, ssh_ports)
+    if c.inherited_policy and not getattr(_args, "dry_run", False):
+        digest = migration.fingerprint(migration.load(c.inherited_policy))
+        receipt = json.loads(cfg.MIGRATION_RECEIPT.read_text()) if (
+            cfg.MIGRATION_RECEIPT.exists()) else {}
+        if receipt.get("digest") != digest and not getattr(_args, "apply_safe", False):
+            raise ValueError("An unconfirmed inherited policy requires --apply-safe, not -s/-r.")
     transaction.loader_content()  # refuse unsafe persistence before changing kernel rules
     before = transaction.snapshot(adopt=getattr(_args, "adopt_legacy", False))
     extra = ""
@@ -205,6 +223,12 @@ def cmd_start(_args: argparse.Namespace) -> None:
     timeout = _args.timeout if getattr(_args, "apply_safe", False) else None
     ident = transaction.apply(script, before, timeout)
     if ident:
+        if c.inherited_policy:
+            transaction.atomic_write(transaction.ROOT / ident / "migration.json", json.dumps({
+                "path": str(c.inherited_policy),
+                "digest": migration.fingerprint(migration.load(c.inherited_policy)),
+                "source": migration.load(c.inherited_policy)["source"],
+            }))
         _warn(f"Rules applied provisionally. Automatic rollback in {_args.timeout}s.")
         _info(f"From a NEW SSH connection confirm: fwsec --confirm {ident}")
         _info("Boot persistence is unchanged until confirmation.")
@@ -279,6 +303,10 @@ def cmd_check(_args: argparse.Namespace) -> None:
     c = cfg.load_config()
     transaction.validate(c, _detect_ssh_ports())
     issues = 0
+    if c.inherited_policy:
+        policy = migration.load(c.inherited_policy)
+        _ok(f"Inherited policy: {policy['source']} ({policy['summary']['rules']} ordered rules)")
+        _info("IPv4/IPv6 and input/output/forward policies come from INHERITED_POLICY.")
 
     # Config file
     if not cfg.CONF_FILE.exists():
@@ -384,6 +412,9 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
     # Allowed ports (from fwsec.conf; SSH is detected and always open)
     c = cfg.load_config()
+    if c.inherited_policy:
+        print(migration.report_text(migration.load(c.inherited_policy)))
+        _info("Legacy TCP_IN/OUT defaults below are not used while INHERITED_POLICY is active.")
     ssh_ports = _detect_ssh_ports()
 
     def _ports(plist: list[str]) -> str:
@@ -850,6 +881,17 @@ Examples:
     g.add_argument("--apply-safe", action="store_true",
                    help="Apply provisionally; roll back unless confirmed from a new SSH session")
     g.add_argument("--confirm", metavar="ID", help="Confirm a pending safe apply")
+    g.add_argument("--migration-report", action="store_true",
+                   help="Show the complete inherited-policy report")
+    g.add_argument("--migration-plan", choices=("csf", "ufw", "firewalld"),
+                   help="Capture and classify live policy without changing rules")
+    g.add_argument("--migration-finalize", action="store_true",
+                   help="Retire exact legacy rules after safe-apply confirmation")
+    p.add_argument("--migration-output", type=Path,
+                   default=Path("/var/lib/fwsec/migration-plan.json"),
+                   help="Path for a live migration plan/report")
+    p.add_argument("--migration-approve", default="",
+                   help="Explicitly approve the exact source fingerprint after ownership review")
     p.add_argument("--timeout", type=int, default=120,
                    help="Safe-apply confirmation deadline in seconds (30–3600)")
     p.add_argument("--adopt-legacy", action="store_true",
@@ -904,7 +946,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         read_only = any((args.version, args.list, args.check, args.grep,
-                         args.geo_status, args.temp_list))
+                         args.geo_status, args.temp_list, args.migration_report))
         if read_only:
             _run_command(parser, args)
         elif args.upgrade:
@@ -917,7 +959,7 @@ def main() -> None:
         elif not any(vars(args).get(k) for k in (
             "start", "restart", "enable", "stop", "disable", "deny", "deny_remove",
             "temp_deny", "temp_remove", "allow", "allow_remove", "geo_update",
-            "dry_run", "apply_safe", "confirm",
+            "dry_run", "apply_safe", "confirm", "migration_finalize", "migration_plan",
         )):
             parser.print_help()
         else:
@@ -940,6 +982,30 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
     elif args.confirm:
         transaction.confirm(args.confirm)
         _ok("Safe apply confirmed and persisted.")
+
+    elif args.migration_report:
+        c = cfg.load_config()
+        path = c.inherited_policy or args.migration_output
+        print(migration.report_text(json.loads(path.read_text())))
+
+    elif args.migration_plan:
+        document = migration.capture(args.migration_plan, args.migration_output,
+                                     args.migration_approve)
+        print(migration.report_text(document))
+        if document["status"] != "ready":
+            raise ValueError("Migration is blocked or requires fingerprint approval; "
+                             "nothing changed.")
+
+    elif args.migration_finalize:
+        c = cfg.load_config()
+        if not c.inherited_policy or not cfg.MIGRATION_RECEIPT.exists():
+            raise ValueError("No confirmed inherited policy is available")
+        policy = migration.load(c.inherited_policy)
+        receipt = json.loads(cfg.MIGRATION_RECEIPT.read_text())
+        migration.finalize(policy, receipt)
+        _ok("Exact reviewed legacy rules retired; configuration/packages retained for recovery.")
+        _info("Old startup disabled without a global flush; "
+              "packages/configs retained for recovery.")
 
     elif args.dry_run or args.apply_safe:
         cmd_start(args)

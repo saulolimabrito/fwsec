@@ -12,6 +12,7 @@ before the `inet filter` chain (priority 0).
 """
 from __future__ import annotations
 
+from fwsec import migration
 from fwsec.config import FwsecConfig, geo_mode
 
 FILTER_TABLE = "inet filter"
@@ -29,6 +30,33 @@ def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
     listen on several at once (main config + sshd_config.d drop-ins), and
     every one of them must stay open or you get locked out of the server.
     """
+
+    if cfg.inherited_policy:
+        migration.load(cfg.inherited_policy)
+        # The complete inherited policy is enforced in inet fwsec. The shared
+        # filter chains remain CrowdSec guards, not a second port/default policy
+        # that would silently narrow or widen the original IPv4/IPv6 rules.
+        return '''
+add table inet filter
+flush table inet filter
+table inet filter {
+    set crowdsec-blacklists { type ipv4_addr; flags timeout; }
+    set crowdsec6-blacklists { type ipv6_addr; flags timeout; }
+    chain input {
+        type filter hook input priority 0; policy accept;
+        ip saddr @crowdsec-blacklists drop
+        ip6 saddr @crowdsec6-blacklists drop
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip saddr @crowdsec-blacklists drop
+        ip6 saddr @crowdsec6-blacklists drop
+    }
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+'''
 
     # Remove SSH ports from tcp_in to avoid duplicate rules
     ssh_set = {str(p) for p in ssh_ports}
@@ -224,7 +252,9 @@ def generate_fwsec_table(cfg: FwsecConfig) -> str:
         .replace("@@ALLOW6_RULE@@", allow6_rule)
         .replace("@@MARK_ACCEPT@@", mark_accept)
         .replace("@@GEO@@", _geo_section(cfg))
-    )
+    ).rsplit("}", 1)[0] + (
+        migration.render(migration.load(cfg.inherited_policy)) if cfg.inherited_policy else ""
+    ) + "}\n"
 
 
 # Private/link-local ranges exempt from geo filtering — internal traffic

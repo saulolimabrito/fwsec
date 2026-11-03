@@ -13,9 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install nftables
-        run: sudo apt-get update -qq && sudo apt-get install -y nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y nftables iptables iproute2
       - name: Run exclusively inside a disposable network namespace
         run: sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/nft_sandbox.py
+      - name: Verify live migration parity with real IPv4 and IPv6 packets
+        run: sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/migration_sandbox.py
 
   lint:
     name: Lint (shellcheck, ruff, mypy)

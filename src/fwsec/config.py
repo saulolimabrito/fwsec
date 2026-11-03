@@ -17,6 +17,8 @@ ALLOW_FILE = CONFIG_DIR / "fwsec.allow"
 DENY_FILE = CONFIG_DIR / "fwsec.deny"
 IGNORE_FILE = CONFIG_DIR / "fwsec.ignore"
 STATE_FILE = CONFIG_DIR / "fwsec.state.json"
+MIGRATION_FILE = CONFIG_DIR / "inherited.json"
+MIGRATION_RECEIPT = CONFIG_DIR / "migration-confirmed.json"
 GEO_DIR = CONFIG_DIR / "geo"
 GEO_INDEX_FILE = GEO_DIR / "index.tsv"
 
@@ -33,6 +35,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "GEO_BLOCK": "",
         "GEO_ALLOW": "",
         "GEO_FORWARD": "0",
+        "INHERITED_POLICY": "",
         "DENY_TEMP_IP_LIMIT": "100",
         "DENY_IP_LIMIT": "1000",
     },
@@ -65,6 +68,7 @@ class FwsecConfig:
     geo_block: list[str] = field(default_factory=list)
     geo_allow: list[str] = field(default_factory=list)
     geo_forward: bool = False
+    inherited_policy: Path | None = None
     deny_temp_limit: int = 100
     deny_limit: int = 1000
     container_mode: bool = False
@@ -77,7 +81,7 @@ class FwsecConfig:
 
 
 def load_config() -> FwsecConfig:
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     for section, values in DEFAULTS.items():
         parser[section] = values
 
@@ -101,6 +105,7 @@ def load_config() -> FwsecConfig:
         geo_block=parse_country_codes(fw.get("GEO_BLOCK", "")),
         geo_allow=parse_country_codes(fw.get("GEO_ALLOW", "")),
         geo_forward=fw.getboolean("GEO_FORWARD", False),
+        inherited_policy=Path(fw["INHERITED_POLICY"]) if fw.get("INHERITED_POLICY") else None,
         deny_temp_limit=fw.getint("DENY_TEMP_IP_LIMIT", 100),
         deny_limit=fw.getint("DENY_IP_LIMIT", 1000),
         container_mode=ct.getboolean("CONTAINER_MODE", False),
