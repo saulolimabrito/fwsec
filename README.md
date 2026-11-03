@@ -111,6 +111,7 @@ sudo bash install.sh
 | *(no flags)* | Installs fwsec. If it is already installed, displays its status and exits. |
 | `--upgrade` | Queries the GitHub repository for the latest version. When a newer release is available, downloads it and upgrades the package and executable while preserving configuration files; otherwise reports that fwsec is up to date. |
 | `--force` | Performs a complete reinstallation. |
+| `--install-only` | Installs code/dependencies only (image building/CI); does not migrate/configure/start the firewall or alter services. |
 | `--no-crowdsec` | Installs fwsec without the CrowdSec integration (CrowdSec and its nftables bouncer can be added later; every fwsec command degrades gracefully when they are absent). |
 
 The installer detects CSF, UFW and firewalld before changing their policy.

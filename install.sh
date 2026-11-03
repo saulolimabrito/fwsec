@@ -1433,6 +1433,7 @@ main() {
     # Parse flags
     FORCE=0
     UPGRADE=0
+    INSTALL_ONLY=0
     NO_CROWDSEC=0
     CONF_IS_NEW=0
     MIGRATION_APPROVE=""
@@ -1441,6 +1442,7 @@ main() {
             --force)       FORCE=1 ;;
             --upgrade)     UPGRADE=1 ;;
             --no-crowdsec) NO_CROWDSEC=1 ;;
+            --install-only) INSTALL_ONLY=1 ;;
             --migration-approve=*) MIGRATION_APPROVE="${arg#*=}" ;;
         esac
     done
@@ -1473,6 +1475,18 @@ main() {
     # Only the package and executable change; configuration is preserved.
     if [[ "$UPGRADE" -eq 1 ]]; then
         run_upgrade
+    fi
+
+    # Explicit code-only mode for image building / unprivileged CI containers.
+    # No source-firewall migration, service changes, config writes or rule apply.
+    if [[ "$INSTALL_ONLY" -eq 1 ]]; then
+        install_base_deps
+        install_python
+        install_uv
+        install_fwsec_package
+        install_binary
+        ok "Code installed only; firewall policy/services/configuration unchanged."
+        return 0
     fi
 
     install_base_deps
