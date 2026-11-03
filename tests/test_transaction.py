@@ -186,6 +186,17 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(transaction.INCLUDE.stat().st_mode & 0o777, 0o640)
         self.assertFalse(transaction.LOADER_DEBIAN.exists())
 
+    def test_administrator_symlinks_are_not_silently_replaced(self):
+        target = self.root / "administrator.nft"
+        target.write_text("original")
+        transaction.INCLUDE.symlink_to(target)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            transaction.atomic_write(transaction.INCLUDE, "replacement")
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            transaction.snapshot_files()
+        self.assertTrue(transaction.INCLUDE.is_symlink())
+        self.assertEqual(target.read_text(), "original")
+
     def trial(self, expired=False):
         ident = "a" * 32
         directory = transaction.ROOT / ident

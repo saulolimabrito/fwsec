@@ -277,6 +277,8 @@ def restore_script(before: dict[str, Any]) -> str:
 
 
 def atomic_write(path: Path, text: str) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing to replace an administrator symlink: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
     fd, tmp = tempfile.mkstemp(dir=str(path.parent))
@@ -362,6 +364,9 @@ def snapshot_files() -> dict[str, Any]:
     result: dict[str, Any] = {}
     for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE,
                  config.MIGRATION_RECEIPT):
+        if path.is_symlink():
+            raise RuntimeError(f"Review symlinked persistence/configuration "
+                               f"before applying: {path}")
         result[str(path)] = ({"text": path.read_text(), "mode": path.stat().st_mode & 0o777}
                              if path.exists() else None)
     return result
