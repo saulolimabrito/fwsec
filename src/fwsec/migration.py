@@ -30,8 +30,10 @@ CSF_CHAINS = {
 
 
 def canonical(snapshot: str) -> str:
-    return "\n".join(s.strip() for s in snapshot.splitlines()
-                     if s.strip() and not s.startswith("#"))
+    # Base-chain counters change while the policy is being tested. They are
+    # observations, not policy; source-change detection must ignore them.
+    return "\n".join(re.sub(r"\[\d+:\d+\]", "[0:0]", s.strip())
+                     for s in snapshot.splitlines() if s.strip() and not s.startswith("#"))
 
 
 def fingerprint(value: Any) -> str:

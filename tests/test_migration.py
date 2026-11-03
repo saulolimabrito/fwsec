@@ -185,6 +185,11 @@ class MigrationTests(unittest.TestCase):
         batch = migration.retirement(doc, 4, "# timestamp changed\n" + doc["snapshots"]["4"])
         self.assertIn("COMMIT", batch)
 
+    def test_live_policy_counters_do_not_invalidate_retirement(self):
+        doc = policy()
+        live = doc["snapshots"]["4"].replace("[0:0]", "[123:4567]")
+        self.assertIn("COMMIT", migration.retirement(doc, 4, live))
+
     def test_native_backend_evidence_is_revalidated(self):
         doc = policy()
         doc["snapshots"]["nft"] = {"nftables": [{"table": {
