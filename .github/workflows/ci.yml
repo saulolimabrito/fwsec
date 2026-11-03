@@ -15,7 +15,12 @@ jobs:
       - name: Install nftables
         run: sudo apt-get update -qq && sudo apt-get install -y nftables iptables iproute2
       - name: Run exclusively inside a disposable network namespace
-        run: sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/nft_sandbox.py
+        run: |
+          set -o pipefail
+          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/nft_sandbox.py 2>&1 | tee /tmp/nft-test.log || {
+            echo "::error::$(tail -n 20 /tmp/nft-test.log | tr '\n' ' ')"
+            exit 1
+          }
       - name: Verify live migration parity with real IPv4 and IPv6 packets
         run: |
           set -o pipefail
