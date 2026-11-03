@@ -77,9 +77,9 @@ jobs:
           . /etc/os-release
           case "${ID}" in
             debian|ubuntu) apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null ;;
-            rocky|almalinux|rhel|centos) dnf install -y -q git curl tar ca-certificates >/dev/null ;;
+            rocky|almalinux|rhel|centos) dnf install --allowerasing -y -q git curl tar ca-certificates >/dev/null ;;
             fedora) dnf install -y -q git curl tar >/dev/null ;;
-            amzn) dnf install -y -q git curl tar >/dev/null ;;
+            amzn) dnf install --allowerasing -y -q git curl tar >/dev/null ;;
             opensuse-leap|sles) zypper --non-interactive install git curl tar ca-certificates >/dev/null ;;
             arch) pacman -Sy --noconfirm git curl >/dev/null ;;
           esac
@@ -89,7 +89,7 @@ jobs:
       - name: Smoke (fwsec -v / -c)
         run: |
           fwsec -v
-          fwsec -c
+          fwsec -c > /tmp/fwsec-check.log 2>&1 || { cat /tmp/fwsec-check.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-check.log)"; exit 1; }
 
   install-smoke-alpine:
     name: Install smoke — alpine:3.20 (musl + OpenRC)

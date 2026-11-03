@@ -1302,7 +1302,7 @@ _list_listeners() {
         fi
     fi
     if [[ -z "$out" ]]; then
-        warn "Could not list listening ports (ss/netstat unavailable or empty)."
+        warn "Could not list listening ports (ss/netstat unavailable or empty)." >&2
     fi
     printf '%s\n' "$out"
 }
