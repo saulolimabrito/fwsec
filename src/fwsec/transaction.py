@@ -132,8 +132,10 @@ def deny_snapshot(objects: list[dict[str, Any]]) -> dict[str, Any]:
                 continue
             if metadata.get("timeout") and "expires" not in metadata:
                 raise ValueError("Cannot determine remaining deny timeout; refusing to apply")
+            # libnftables JSON timeout/expires are seconds (unlike netlink's
+            # millisecond attributes). Do not divide the JSON value by 1000.
             entries.append({"value": _address(metadata["val"]), "deadline": (
-                now + metadata["expires"] / 1000 if "expires" in metadata else None)})
+                now + metadata["expires"] if "expires" in metadata else None)})
         result[item["name"]] = entries
     return result
 

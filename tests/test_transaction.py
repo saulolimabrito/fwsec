@@ -112,7 +112,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_rollback_preserves_remaining_timeout_not_original_duration(self):
         objects = [{"set": {"family": "inet", "table": "fwsec", "name": "deny4", "elem": [
-            {"elem": {"val": "192.0.2.1", "timeout": 600000, "expires": 10000}},
+            {"elem": {"val": "192.0.2.1", "timeout": 600, "expires": 10}},
             "198.51.100.1",
         ]}}]
         with patch("time.monotonic", return_value=100):
@@ -137,7 +137,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_ambiguous_timed_snapshot_is_rejected(self):
         item = {"set": {"family": "inet", "table": "fwsec", "name": "deny4", "elem": [
-            {"elem": {"val": "192.0.2.1", "timeout": 600000}}
+            {"elem": {"val": "192.0.2.1", "timeout": 600}}
         ]}}
         with self.assertRaisesRegex(ValueError, "remaining deny timeout"):
             transaction.deny_snapshot([item])
