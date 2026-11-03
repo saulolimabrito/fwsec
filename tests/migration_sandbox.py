@@ -81,7 +81,13 @@ def run() -> None:
             document = migration.capture("ufw", root / "plan.json", first["fingerprint"])
             assert document["status"] == "ready"
             config.CONF_FILE.write_text(f"[firewall]\nINHERITED_POLICY = {root / 'plan.json'}\n")
-            nft._run_script("table inet management { chain unrelated { counter; } }")
+            nft._run_script('''
+table inet management {
+    chain unrelated {
+        counter
+    }
+}
+''')
             args = argparse.Namespace(apply_safe=True, timeout=30,
                                       adopt_legacy=False, dry_run=False)
             with transaction.locked():
