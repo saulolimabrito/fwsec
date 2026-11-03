@@ -114,11 +114,11 @@ def remove_temp_block(ip: str) -> bool:
 def list_temp_blocks() -> list[TempEntry]:
     state = load()
     now = time.time()
-    # Prune expired entries
+    # Queries must not race a CLI writer by saving a pruned read/modify/write
+    # snapshot outside its transaction lock. Expiry is enforced by the kernel;
+    # retain metadata so an expired temp entry in the historical deny file is
+    # not accidentally restored as a permanent ban on the next reload.
     active = {ip: e for ip, e in state.temp_blocks.items() if e.expires_at > now}
-    if len(active) != len(state.temp_blocks):
-        state.temp_blocks = active
-        save(state)
     return list(active.values())
 
 

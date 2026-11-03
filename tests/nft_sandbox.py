@@ -83,6 +83,8 @@ table inet filter {
                         "{ 198.51.100.10 }")[0] == 0
         # A real detached worker must survive the launching process exiting.
         # The 30s minimum is intentional; run this once per CI job.
+        nft._run_script("add element inet fwsec deny4 { 192.0.2.99 timeout 60s, "
+                        "192.0.2.98 timeout 2s }\n")
         before = transaction.snapshot()
         (base / "before.json").write_text(__import__("json").dumps(before))
         launcher = '''
@@ -109,6 +111,12 @@ with transaction.locked():
             raise AssertionError((transaction.ROOT / ident / "watchdog.log").read_text())
         assert not nft.element_exists("allow4", "203.0.113.7")
         assert nft.element_exists("allow4", "192.0.2.1")
+        assert nft.element_exists("deny4", "192.0.2.99")
+        assert not nft.element_exists("deny4", "192.0.2.98"), "Expired ban was resurrected"
+        timed = transaction.deny_snapshot(transaction._objects())["deny4"]
+        remaining = next(e["deadline"] - time.monotonic()
+                         for e in timed if e["value"] == "192.0.2.99")
+        assert 10 < remaining < 35, f"Rollback reset the original 60s timeout: {remaining}"
         assert nft._run("list", "table", "inet", "management")[0] == 0
         print("PASS: nft validation, atomic apply, reload, scoped persistence, detached rollback")
 

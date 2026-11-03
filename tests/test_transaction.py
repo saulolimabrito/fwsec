@@ -58,6 +58,16 @@ class TransactionTests(unittest.TestCase):
         self.assertNotIn("flush ruleset", script)
         self.assertNotIn("flush table inet filter", script)
 
+    def test_explicit_permanent_ban_wins_over_old_temp_metadata(self):
+        config.DENY_FILE.write_text("192.0.2.1\n")
+        temp = state.TempEntry("192.0.2.1", "", time.time() - 1, 10)
+        permanent = state.DenyEntry("192.0.2.1", "permanent", time.time())
+        record = state.State({temp.ip: temp}, {}, {permanent.ip: permanent})
+        with patch("fwsec.state.load", return_value=record):
+            script = transaction.build(config.FwsecConfig(), [22], self.before)
+        self.assertIn("add element inet fwsec deny4 { 192.0.2.1/32 }", script)
+        self.assertNotIn("192.0.2.1/32 timeout", script)
+
     def test_validation_failure_never_applies(self):
         with patch.object(transaction, "check", side_effect=RuntimeError("invalid")), \
                 patch("fwsec.nft._run_script") as apply:
@@ -99,6 +109,45 @@ class TransactionTests(unittest.TestCase):
         self.assertNotIn("libvirt", script)
         self.assertNotIn("flush ruleset", script)
         self.assertNotIn("flush table inet filter", script)
+
+    def test_rollback_preserves_remaining_timeout_not_original_duration(self):
+        objects = [{"set": {"family": "inet", "table": "fwsec", "name": "deny4", "elem": [
+            {"elem": {"val": "192.0.2.1", "timeout": 600000, "expires": 10000}},
+            "198.51.100.1",
+        ]}}]
+        with patch("time.monotonic", return_value=100):
+            elements = transaction.deny_snapshot(objects)
+        before = {"fwsec": '''table inet fwsec {
+    set deny4 {
+        type ipv4_addr
+        flags interval,timeout
+        elements = { 192.0.2.1 timeout 10m, 198.51.100.1 }
+    }
+}
+''', "deny_elements": elements}
+        with patch("time.monotonic", return_value=106):
+            restored = transaction.restore_timeouts(before)
+        self.assertIn("192.0.2.1 timeout 4000ms", restored)
+        self.assertIn("198.51.100.1", restored)
+        self.assertNotIn("timeout 10m", restored)
+        with patch("time.monotonic", return_value=112):
+            restored = transaction.restore_timeouts(before)
+        self.assertNotIn("192.0.2.1", restored)
+        self.assertIn("198.51.100.1", restored)
+
+    def test_ambiguous_timed_snapshot_is_rejected(self):
+        item = {"set": {"family": "inet", "table": "fwsec", "name": "deny4", "elem": [
+            {"elem": {"val": "192.0.2.1", "timeout": 600000}}
+        ]}}
+        with self.assertRaisesRegex(ValueError, "remaining deny timeout"):
+            transaction.deny_snapshot([item])
+
+    def test_reading_temporary_blocks_does_not_write_outside_writer_lock(self):
+        entry = state.TempEntry("192.0.2.1", "", time.time() - 1, 10)
+        with patch("fwsec.state.load", return_value=state.State({entry.ip: entry}, {}, {})), \
+                patch("fwsec.state.save") as save:
+            self.assertEqual(state.list_temp_blocks(), [])
+        save.assert_not_called()
 
     def test_persistence_preserves_foreign_loader_includes(self):
         transaction.LOADER_RHEL.write_text('include "management.nft"\n')

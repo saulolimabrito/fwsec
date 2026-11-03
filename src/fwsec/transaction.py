@@ -102,6 +102,65 @@ def _dump(*args: str) -> str:
     return out
 
 
+def _address(value: Any) -> str:
+    if isinstance(value, str):
+        return str(ipaddress.ip_network(value, strict=False)) if "/" in value else str(
+            ipaddress.ip_address(value))
+    if isinstance(value, dict) and "prefix" in value:
+        prefix = value["prefix"]
+        return str(ipaddress.ip_network(f"{prefix['addr']}/{prefix['len']}", strict=False))
+    if isinstance(value, dict) and "range" in value:
+        return _address(value["range"][0]) + "-" + _address(value["range"][1])
+    raise ValueError("Cannot safely snapshot this deny-set element encoding")
+
+
+def deny_snapshot(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep absolute monotonic expiry, not the original full ban duration."""
+    result: dict[str, Any] = {}
+    now = time.monotonic()
+    for obj in objects:
+        item = obj.get("set", {})
+        if item.get("family") != "inet" or item.get("table") != "fwsec" or item.get(
+            "name"
+        ) not in ("deny4", "deny6"):
+            continue
+        entries = []
+        for raw in item.get("elem", []):
+            metadata = raw.get("elem") if isinstance(raw, dict) else None
+            if metadata is None:
+                entries.append({"value": _address(raw), "deadline": None})
+                continue
+            if metadata.get("timeout") and "expires" not in metadata:
+                raise ValueError("Cannot determine remaining deny timeout; refusing to apply")
+            entries.append({"value": _address(metadata["val"]), "deadline": (
+                now + metadata["expires"] / 1000 if "expires" in metadata else None)})
+        result[item["name"]] = entries
+    return result
+
+
+def restore_timeouts(before: dict[str, Any]) -> str:
+    text = str(before["fwsec"])
+    for name, entries in before.get("deny_elements", {}).items():
+        values = []
+        for entry in entries:
+            if entry["deadline"] is None:
+                values.append(entry["value"])
+            else:
+                remaining_ms = int((entry["deadline"] - time.monotonic()) * 1000)
+                if remaining_ms > 0:
+                    values.append(f"{entry['value']} timeout {remaining_ms}ms")
+        pattern = rf"(\bset\s+{name}\s*\{{)(.*?)(\n\s*\}})"
+
+        def replace(match: re.Match[str]) -> str:
+            body = re.sub(r"elements\s*=\s*\{.*?\}", "", match.group(2), flags=re.S)
+            if values:
+                body += "\n        elements = { " + ", ".join(values) + " }"
+            return match.group(1) + body + match.group(3)
+
+        text = re.sub(pattern, replace, text, flags=re.S)
+    return text
+
+
 def snapshot(adopt: bool = False) -> dict[str, Any]:
     objects = _objects()
     tables = {o["table"]["name"] for o in objects
@@ -136,6 +195,7 @@ def snapshot(adopt: bool = False) -> dict[str, Any]:
         "sets": [o["set"]["name"] for o in objects if "set" in o
                  and o["set"]["family"] == "inet" and o["set"]["table"] == "filter"],
         "files": snapshot_files(),
+        "deny_elements": deny_snapshot(objects),
     }
 
 
@@ -163,7 +223,10 @@ def build(c: config.FwsecConfig, ssh_ports: list[int], before: dict[str, Any],
         "chain whitelist {", f'chain whitelist {{\n        comment "{MARKER}"'
     )
     script = prefix + filt + fw
-    temps = state.load().temp_blocks
+    record = state.load()
+    permanent = {ipaddress.ip_network(e.ip, strict=False) for e in record.deny_meta.values()}
+    temps = {ip: entry for ip, entry in record.temp_blocks.items()
+             if ipaddress.ip_network(entry.ip, strict=False) not in permanent}
     temporary = {ipaddress.ip_network(e.ip, strict=False) for e in temps.values()}
     for kind, entries in (("allow", config.read_allow()), ("deny", config.read_deny())):
         for family in (4, 6):
@@ -204,7 +267,7 @@ def restore_script(before: dict[str, Any]) -> str:
         if name in names:
             script += f"flush chain inet filter {name}\n"
             script += f"delete chain inet filter {name}\n"
-    script += str(before["fwsec"])
+    script += restore_timeouts(before)
     script += "\n".join(before["chains"].values())
     # Empty bouncer sets created on a fresh install are left in place: deleting
     # them could race a bouncer or third party referencing them.
