@@ -595,7 +595,8 @@ def cmd_upgrade(_args: argparse.Namespace) -> None:
            "lists, state) is preserved — only code and executable are updated.")
     sys.stdout.flush()
     sys.stderr.flush()
-    rc = subprocess.call(["bash", str(installer), "--upgrade"])
+    rc = subprocess.call(["bash", str(installer), "--upgrade"],
+                         env={**os.environ, "FWSEC_COLOR": getattr(_args, "color", "auto")})
     sys.exit(rc)
 
 

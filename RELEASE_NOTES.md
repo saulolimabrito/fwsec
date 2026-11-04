@@ -1,4 +1,10 @@
-# fwsec 1.6.0 — CLI quality and truthful diagnostics
+# fwsec 1.6.1 — CLI quality and truthful diagnostics
+
+The installer invoked by --upgrade now honors terminal detection, NO_COLOR and
+the CLI color choice too. This completes clean redirected output across the
+Python CLI and its Bash child. No firewall-policy changes from 1.6.0.
+
+## Included from 1.6.0
 
 - Grouped help, short default guide/version, filtered/bounded lists, optional
   read-only terminal menu and schema-versioned JSON for all read-only queries.

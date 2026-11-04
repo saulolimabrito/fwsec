@@ -76,6 +76,18 @@ migration_backup() { mkdir -p "$MIGRATION_BACKUP"; }
         self.assertIn('--upgrade-activate "$ident"', upgrade)
         self.assertIn('--rollback "$ident"', upgrade)
 
+    def test_installer_color_auto_and_no_color_in_pipes(self):
+        helpers = self.script[self.script.index("# Colors"):self.script.index("# Initial checks")]
+        for extra in ({}, {"NO_COLOR": ""}, {"FWSEC_COLOR": "never"}):
+            env = {k: v for k, v in os.environ.items() if k not in ("FWSEC_COLOR", "NO_COLOR")}
+            r = subprocess.run(["bash"], input=helpers + '\nok "QA"\n', text=True,
+                               capture_output=True, env={**env, **extra})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout, "[OK] QA\n")
+        r = subprocess.run(["bash"], input=helpers + '\nok "QA"\n', text=True,
+                           capture_output=True, env={**os.environ, "FWSEC_COLOR": "always"})
+        self.assertIn("\033[", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

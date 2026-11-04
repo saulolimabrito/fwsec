@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-FWSEC_VERSION="1.6.0"
+FWSEC_VERSION="1.6.1"
 REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"
@@ -21,6 +21,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)
 # Colors
 RED='\033[91m'; GREEN='\033[92m'; YELLOW='\033[93m'; CYAN='\033[96m'
 BOLD='\033[1m'; NC='\033[0m'
+if [[ "${FWSEC_COLOR:-auto}" != "always" ]]; then
+    if [[ "${FWSEC_COLOR:-auto}" == "never" || ! -t 1 || -n "${NO_COLOR+x}" || "${TERM:-}" == "dumb" ]]; then
+        RED=""; GREEN=""; YELLOW=""; CYAN=""; BOLD=""; NC=""
+    fi
+fi
 
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 err()  { echo -e "${RED}[ERR]${NC} $*" >&2; }
