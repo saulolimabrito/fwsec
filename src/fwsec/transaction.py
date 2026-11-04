@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -411,7 +412,7 @@ def loader_content() -> tuple[Path, str]:
 def snapshot_files() -> dict[str, Any]:
     result: dict[str, Any] = {}
     for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE, config.EXECUTABLE,
-                 config.MIGRATION_RECEIPT):
+                 config.MIGRATION_RECEIPT, config.APPLIED_FILE):
         if path.is_symlink():
             raise RuntimeError(f"Review symlinked persistence/configuration "
                                f"before applying: {path}")
@@ -445,6 +446,43 @@ def persist() -> None:
     check(script)
     atomic_write(INCLUDE, PERSIST_MARKER + "\n" + script)
     atomic_write(loader, content)
+    record_applied()
+
+
+def static_receipt(rows: list[dict[str, Any]], ports: list[int]) -> dict[str, Any]:
+    from fwsec import compat
+    c = config.load_config()
+    settings = asdict(c)
+    settings.pop("enabled", None)
+    effective = json.loads(json.dumps(settings, default=str))
+    if c.inherited_policy:
+        effective["inherited_document"] = migration.load(c.inherited_policy)
+    selected = []
+    for row in rows:
+        copy = json.loads(json.dumps(row))
+        if "set" in copy:
+            copy["set"].pop("elem", None)  # Dynamic list contents/expiry are not static rules.
+        selected.append(copy)
+    specs = compat.hooks(c, c.container_mode and c.container_policy == "filtered")
+    kernel = {name: compat.objects(selected, name, name, specs[name])
+              for name in ("filter", "fwsec")}
+    return {"config": effective, "ssh_ports": ports, "kernel": kernel}
+
+
+def record_applied() -> None:
+    from fwsec.cli import _detect_ssh_ports
+    atomic_write(config.APPLIED_FILE, json.dumps(static_receipt(_objects(), _detect_ssh_ports())))
+
+
+def applied_status(rows: list[dict[str, Any]], ports: list[int]) -> str:
+    if not config.APPLIED_FILE.exists():
+        return "not verified (no receipt from this version)"
+    try:
+        old = json.loads(config.APPLIED_FILE.read_text())
+        current = static_receipt(rows, ports)
+        return "verified" if old == current else "changed"
+    except (ValueError, OSError, KeyError):
+        return "not verified (invalid receipt)"
 
 
 def _directory(ident: str) -> Path:

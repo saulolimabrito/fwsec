@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-FWSEC_VERSION="1.5.1"
+FWSEC_VERSION="1.6.0"
 REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"

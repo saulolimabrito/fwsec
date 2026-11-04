@@ -29,6 +29,7 @@ def run() -> None:
         config.STATE_FILE = base / "state"
         config.EXECUTABLE = base / "fwsec-wrapper"
         config.MIGRATION_RECEIPT = base / "receipt"
+        config.APPLIED_FILE = base / "applied.json"
         transaction.ROOT = base / "transactions"
         transaction.LOCK = base / "lock"
         transaction.LOADER_DEBIAN = base / "nftables.conf"

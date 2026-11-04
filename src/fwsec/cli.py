@@ -7,9 +7,9 @@ CSF-style CLI interface
 from __future__ import annotations
 
 import argparse
-import datetime
 import ipaddress
 import json
+import os
 import re
 import shutil
 import socket
@@ -29,6 +29,7 @@ from fwsec import (
     rules,
     state,
     transaction,
+    ui,
     upgrade,
 )
 from fwsec import config as cfg
@@ -46,25 +47,54 @@ RESET = "\033[0m"
 
 
 def _ok(msg: str) -> None:
-    print(f"{GREEN}[OK]{RESET} {msg}")
+    print(f"{GREEN}[OK]{RESET} {ui.safe(msg)}")
 
 
 def _err(msg: str) -> None:
-    print(f"{RED}[ERR]{RESET} {msg}", file=sys.stderr)
+    print(f"{RED}[ERR]{RESET} {ui.safe(msg)}", file=sys.stderr)
 
 
 def _info(msg: str) -> None:
-    print(f"{CYAN}[*]{RESET} {msg}")
+    print(f"{CYAN}[*]{RESET} {ui.safe(msg)}")
 
 
 def _warn(msg: str) -> None:
-    print(f"{YELLOW}[!]{RESET} {msg}")
+    print(f"{YELLOW}[!]{RESET} {ui.safe(msg)}")
 
 
 def _header(title: str) -> None:
-    print(f"\n{BOLD}{CYAN}{'─' * 60}{RESET}")
+    width = min(60, max(20, shutil.get_terminal_size((80, 24)).columns - 2))
+    print(f"\n{BOLD}{CYAN}{'─' * width}{RESET}")
     print(f"{BOLD}{CYAN}  {title}{RESET}")
-    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}")
+    print(f"{BOLD}{CYAN}{'─' * width}{RESET}")
+
+
+class PartialFailure(RuntimeError):
+    """Primary change succeeded but an integration/application step failed."""
+
+
+def _confirm_action(args: argparse.Namespace, message: str, required: bool = False) -> None:
+    if getattr(args, "yes", False):
+        return
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        if input(message + " [y/N]: ").strip().lower() not in ("y", "yes"):
+            _info("Cancelled. No changes made.")
+            raise SystemExit(130)
+    elif required:
+        raise ValueError(message + " Explicit acknowledgement required: add --yes.")
+
+
+def _protect_admin(args: argparse.Namespace, ip: str) -> None:
+    peer = os.environ.get("SSH_CONNECTION", "").split()
+    if peer and ipaddress.ip_address(peer[0]) in ipaddress.ip_network(ip, strict=False):
+        _confirm_action(args, f"This targets your current SSH client {peer[0]} and may cut access.",
+                        required=True)
+
+
+def _sync_failed(success: bool, action: str) -> None:
+    if not success:
+        raise PartialFailure("Local change completed; CrowdSec " + action +
+                             " failed. Check the LAPI and retry the integration.")
 
 
 def _require_root() -> None:
@@ -177,18 +207,14 @@ def _detect_ssh_ports() -> list[int]:
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_version(_args: argparse.Namespace) -> None:
-    print(f"fwsec {__version__}")
-    if crowdsec.available():
-        print(f"crowdsec {crowdsec.version()}")
-    rc, out, _ = nft._run("--version")
-    if rc == 0:
-        print(out.strip())
+def cmd_version(args: argparse.Namespace) -> None:
+    ui.query("version", args, [])
 
 
 def cmd_start(_args: argparse.Namespace) -> str | None:
     _require_root()
-    _info("Starting fwsec firewall...")
+    if not getattr(_args, "dry_run", False):
+        _info("Starting fwsec firewall...")
 
     try:
         nft.preflight()
@@ -197,6 +223,12 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
         sys.exit(1)
 
     c = cfg.load_config()
+
+    if not c.enabled and not any(getattr(_args, name, False) for name in (
+        "enable", "apply_safe", "dry_run", "upgrade_apply"
+    )):
+        _info("No change: fwsec is disabled in configuration. Use fwsec --enable to enable it.")
+        return None
 
     ssh_ports = _detect_ssh_ports()
     transaction.validate(c, ssh_ports)
@@ -246,7 +278,11 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
                 "source": migration.load(c.inherited_policy)["source"],
             }))
         _warn(f"Rules applied provisionally. Automatic rollback in {_args.timeout}s.")
-        _info(f"From a NEW SSH connection confirm: fwsec --confirm {ident}")
+        if getattr(_args, "upgrade_apply", False):
+            _info("Upgrade installer will activate and confirm automatically; "
+                  "rollback stays armed.")
+        else:
+            _info(f"From a NEW SSH connection confirm: fwsec --confirm {ident}")
         _info("Boot persistence is unchanged until confirmation.")
     else:
         try:
@@ -284,15 +320,23 @@ def _apply_container_filter() -> None:
 
 def cmd_stop(_args: argparse.Namespace) -> None:
     _require_root()
+    _confirm_action(_args, "Stop fwsec filtering? Third-party firewalls remain active.")
     before = transaction.snapshot(adopt=getattr(_args, "adopt_legacy", False))
     script = "delete table inet fwsec\n" if before["fwsec"] else ""
     for name in before["chains"]:
         script += f"flush chain inet filter {name}\n"
         script += (f"add chain inet filter {name} {{ type filter hook {name} "
-                   f'priority 0; policy accept; comment "{transaction.MARKER}"; }}\n')
+                    f'priority 0; policy accept; comment "{transaction.MARKER}"; }}\n')
+        script += f'add rule inet filter {name} counter comment "{transaction.MARKER}"\n'
     if script:
         transaction.check(script)
         nft._run_script(script)
+        try:
+            _persist_nftables()
+        except (OSError, RuntimeError):
+            nft._run_script(transaction.restore_script(before))
+            transaction.restore_files(before)
+            raise
     _ok("fwsec stopped. Third-party rules and CrowdSec sets were not removed.")
 
 
@@ -310,197 +354,26 @@ def cmd_enable(_args: argparse.Namespace) -> None:
 
 def cmd_restart(_args: argparse.Namespace) -> None:
     _require_root()
+    if not cfg.load_config().enabled:
+        _info("No change: fwsec is disabled. Use fwsec --enable.")
+        return
     _info("Restarting fwsec...")
     cmd_start(_args)
     _ok("fwsec restarted.")
 
 
-def cmd_check(_args: argparse.Namespace) -> None:
-    _header("fwsec configuration check")
-    c = cfg.load_config()
-    transaction.validate(c, _detect_ssh_ports())
-    issues = 0
-    if c.inherited_policy:
-        policy = migration.load(c.inherited_policy)
-        _ok(f"Inherited policy: {policy['source']} ({policy['summary']['rules']} ordered rules)")
-        _info("IPv4/IPv6 and input/output/forward policies come from INHERITED_POLICY.")
-
-    # Config file
-    if not cfg.CONF_FILE.exists():
-        _warn(f"Config file not found: {cfg.CONF_FILE}  (defaults will be used)")
-    else:
-        _ok(f"Config: {cfg.CONF_FILE}")
-
-    # Enabled?
-    if not c.enabled:
-        _warn("ENABLED = 0 — firewall is disabled.")
-        issues += 1
-    else:
-        _ok("ENABLED = 1")
-
-    # TCP_IN ports
-    _ok(f"TCP_IN  : {', '.join(c.tcp_in) or '(none)'}")
-    _ok(f"TCP_OUT : {', '.join(c.tcp_out) or '(none)'}")
-    _ok("OUTPUT policy: " + ("per-family inherited policy" if c.inherited_policy
-                              else c.output_policy.upper()))
-
-    # Allow/deny files
-    allow_list = cfg.read_allow()
-    deny_list = cfg.read_deny()
-    _ok(f"Allow list: {len(allow_list)} entries ({cfg.ALLOW_FILE})")
-    _ok(f"Deny list : {len(deny_list)} entries ({cfg.DENY_FILE})")
-
-    # nftables table
-    if nft.table_exists():
-        _ok("fwsec nftables table: LOADED")
-    else:
-        _warn("fwsec nftables table: NOT LOADED (run: fwsec -s)")
-        issues += 1
-
-    # CrowdSec
-    if crowdsec.available():
-        _ok("CrowdSec: available")
-        bouncers = crowdsec.list_bouncers()
-        _ok(f"CrowdSec bouncers: {len(bouncers)} registered")
-    else:
-        _warn("CrowdSec: not available (cscli not found)")
-
-    # Containers
-    runtimes = containers.detect_runtimes()
-    if runtimes:
-        _ok(f"Container runtime(s): {', '.join(runtimes)}")
-        if not c.container_mode:
-            _warn("CONTAINER_MODE = 0 — container networking is blocked by the "
-                  "forward chain. Set CONTAINER_MODE = 1 and run: fwsec -r")
-            issues += 1
-        else:
-            _ok(f"Container mode: enabled (policy: {c.container_policy})")
-        published = containers.externally_published_ports()
-        if published:
-            plist = ", ".join(f"{p.host_port}/{p.proto}→{p.container}" for p in published)
-            _ok(f"Published container ports: {plist}")
-            if c.container_policy != "filtered":
-                _info("CONTAINER_POLICY = open — published ports accept any source. "
-                      "Use 'filtered' to restrict them to the allow list.")
-    elif c.container_mode:
-        _info("CONTAINER_MODE = 1 but no running container runtime was found.")
-
-    # SSH port
-    ssh_ports = _detect_ssh_ports()
-    _ok(f"SSH port(s) detected: {', '.join(str(p) for p in ssh_ports)}")
-
-    # Geo policy
-    gmode = cfg.geo_mode(c)
-    if gmode == "off":
-        _info("Geo policy: off (GEO_BLOCK/GEO_ALLOW not set)")
-    else:
-        codes = c.geo_block or c.geo_allow
-        _ok(f"Geo policy: {gmode} mode — countries: {', '.join(codes)}")
-        g4, g6 = geo.resolve_all(codes)
-        if not g4 and not g6:
-            if gmode == "allow":
-                _err("GEO_ALLOW active with no zone data — run 'fwsec --geo-update' "
-                     "BEFORE 'fwsec -r', or every non-private source will be dropped.")
-                issues += 1
-            else:
-                _warn("Geo zones not downloaded yet. Run: fwsec --geo-update")
-                issues += 1
-        if nft.table_exists() and (g4 or g6):
-            loaded4 = len(nft.list_elements("geo4"))
-            loaded6 = len(nft.list_elements("geo6"))
-            _ok(f"Geo sets loaded: {loaded4} IPv4 / {loaded6} IPv6 elements")
-        ts = geo.zones_last_updated()
-        if ts:
-            age = (time.time() - ts) / 86400
-            if age > 30:
-                _warn(f"Geo zone data is {age:.0f} days old. Run: fwsec --geo-update")
-        if gmode == "allow" and not allow_list:
-            _warn("GEO_ALLOW active and fwsec.allow is EMPTY — add your admin "
-                  "IP ('fwsec -a YOUR_IP') to guarantee recovery access.")
-            issues += 1
-
-    print()
-    if issues == 0:
-        _ok("Configuration OK.")
-    else:
-        _warn(f"{issues} issue(s) found.")
+def cmd_check(args: argparse.Namespace) -> None:
+    ui.query("check", args, _detect_ssh_ports())
 
 
-def cmd_list(_args: argparse.Namespace) -> None:
-    _header("fwsec — loaded rules")
-
-    # Allowed ports (from fwsec.conf; SSH is detected and always open)
-    c = cfg.load_config()
-    if c.inherited_policy:
-        print(migration.report_text(migration.load(c.inherited_policy)))
-        _info("Legacy TCP_IN/OUT defaults below are not used while INHERITED_POLICY is active.")
-    ssh_ports = _detect_ssh_ports()
-
-    def _ports(plist: list[str]) -> str:
-        return ", ".join(plist) if plist else "(none)"
-
-    print(f"\n{BOLD}Allowed ports{RESET}")
-    print(f"  {CYAN}TCP IN {RESET} : {', '.join(str(p) for p in ssh_ports)} (SSH)"
-          f"{', ' + _ports(c.tcp_in) if c.tcp_in else ''}")
-    print(f"  {CYAN}TCP OUT{RESET} : {_ports(c.tcp_out)}")
-    print(f"  {CYAN}OUTPUT POLICY{RESET}: " + (
-        "inherited (see report)" if c.inherited_policy else c.output_policy.upper()
-    ))
-    print(f"  {CYAN}UDP IN {RESET} : {_ports(c.udp_in)}")
-    print(f"  {CYAN}UDP OUT{RESET} : {_ports(c.udp_out)}")
-    print(f"  {CYAN}ICMP IN{RESET} : {'yes' if c.icmp_in else 'no'}")
-
-    if not nft.table_exists():
-        _warn("fwsec table not loaded. Run: fwsec -s")
-        return
-
-    summary = nft.get_summary()
-    c_deny = crowdsec.list_decisions() if crowdsec.available() else []
-
-    def _comment(ip: str) -> str:
-        c = state.get_comment(ip)
-        return f"  # {c}" if c else ""
-
-    n_allow = len(summary.allow4) + len(summary.allow6)
-    print(f"\n{BOLD}Allow list (fwsec-allow){RESET} — {n_allow} IPs")
-    for ip in summary.allow4 + summary.allow6:
-        print(f"  {GREEN}{ip}{RESET}{_comment(ip)}")
-
-    print(f"\n{BOLD}Deny list (fwsec-deny){RESET} — {len(summary.deny4) + len(summary.deny6)} IPs")
-    for ip in summary.deny4 + summary.deny6:
-        print(f"  {RED}{ip}{RESET}{_comment(ip)}")
-
-    print(f"\n{BOLD}CrowdSec decisions{RESET} — {len(c_deny)} active bans")
-    for d in c_deny[:20]:
-        print(f"  {RED}{d.ip}{RESET}  [{d.duration}]  {d.reason}")
-    if len(c_deny) > 20:
-        print(f"  ... and {len(c_deny) - 20} more")
-
-    published = containers.published_ports()
-    if published:
-        print(f"\n{BOLD}Published container ports{RESET} — {len(published)} mappings")
-        for p in published:
-            local = "  (local only)" if p.host_ip in ("127.0.0.1", "::1", "[::1]") else ""
-            print(f"  {CYAN}{p.host_port}/{p.proto}{RESET} → "
-                  f"{p.container}:{p.container_port} [{p.runtime}]{local}")
-
-    gmode = cfg.geo_mode(c)
-    if gmode != "off":
-        gcodes = c.geo_block or c.geo_allow
-        print(f"\n{BOLD}Geo policy ({gmode}){RESET} — countries: {', '.join(gcodes)}")
-        counts = geo.zone_counts(gcodes)
-        for cc in gcodes:
-            print(f"  {CYAN}{cc}{RESET}: {counts.get(cc, 0)} CIDRs")
-        if nft.table_exists():
-            print(f"  Loaded in nftables: {len(nft.list_elements('geo4'))} IPv4 / "
-                  f"{len(nft.list_elements('geo6'))} IPv6")
-
-    print()
+def cmd_list(args: argparse.Namespace) -> None:
+    ui.query("list", args, _detect_ssh_ports())
 
 
 def cmd_deny(args: argparse.Namespace) -> None:
     _require_root()
     ip = _resolve(args.ip)
+    _protect_admin(args, ip)
     comment = args.comment or ""
 
     _info(f"Blocking {ip} permanently...")
@@ -514,8 +387,8 @@ def cmd_deny(args: argparse.Namespace) -> None:
     state.add_deny_meta(ip, comment)
 
     c = cfg.load_config()
-    if c.crowdsec_enabled and c.crowdsec_sync_deny and crowdsec.available():
-        crowdsec.add_decision(ip, reason=comment or "fwsec manual ban")
+    if c.crowdsec_enabled and c.crowdsec_sync_deny and shutil.which("cscli"):
+        _sync_failed(crowdsec.add_decision(ip, reason=comment or "fwsec manual ban"), "sync")
 
     _ok(f"Blocked: {ip}{f'  ({comment})' if comment else ''}")
 
@@ -525,21 +398,30 @@ def cmd_deny_remove(args: argparse.Namespace) -> None:
     ip = _resolve(args.ip)
     _info(f"Removing block for {ip}...")
 
-    nft.undeny(ip)
-    cfg.remove_deny(ip)
+    removed = nft.undeny(ip)
+    configured = cfg.remove_deny(ip)
     state.remove_deny_meta(ip)
 
     c = cfg.load_config()
-    if c.crowdsec_enabled and crowdsec.available():
-        crowdsec.delete_decision(ip)
+    if c.crowdsec_enabled and shutil.which("cscli"):
+        _sync_failed(crowdsec.delete_decision(ip), "removal")
 
-    _ok(f"Block removed: {ip}")
+    _ok(f"Block removed: {ip}" if removed or configured else
+        f"No change: {ip} was not in the local deny list.")
 
 
 def cmd_temp_deny(args: argparse.Namespace) -> None:
     _require_root()
     ip = _resolve(args.ip)
-    duration_sec = int(args.duration)
+    try:
+        duration_sec = int(args.duration)
+    except ValueError as exc:
+        raise ValueError("Duration must be a positive number of seconds; example: 3600.") from exc
+    if not 1 <= duration_sec <= 2147483647:
+        raise ValueError("Duration must be between 1 and 2147483647 seconds; example: 3600.")
+    _protect_admin(args, ip)
+    if state.load().deny_meta.get(ip):
+        raise ValueError("IP has a permanent local ban. Remove it before creating a temporary ban.")
     comment = args.comment or ""
 
     _info(f"Temporarily blocking {ip} for {_fmt_duration(duration_sec)}...")
@@ -553,35 +435,28 @@ def cmd_temp_deny(args: argparse.Namespace) -> None:
     cfg.add_deny(ip, comment)
 
     c = cfg.load_config()
-    if c.crowdsec_enabled and c.crowdsec_sync_deny and crowdsec.available():
-        crowdsec.add_decision(ip, reason=comment or "fwsec temp ban", duration=f"{duration_sec}s")
+    if c.crowdsec_enabled and c.crowdsec_sync_deny and shutil.which("cscli"):
+        _sync_failed(crowdsec.add_decision(
+            ip, reason=comment or "fwsec temp ban", duration=f"{duration_sec}s"), "sync")
 
-    expires = datetime.datetime.fromtimestamp(time.time() + duration_sec)
+    expires = ui.timestamp(time.time() + duration_sec)
     suffix = f"  ({comment})" if comment else ""
-    _ok(f"Temp blocked: {ip} until {expires:%Y-%m-%d %H:%M:%S}{suffix}")
+    _ok(f"Temp blocked: {ip} until {expires}{suffix}")
 
 
-def cmd_temp_list(_args: argparse.Namespace) -> None:
-    _header("Temporary blocks")
-    blocks = state.list_temp_blocks()
-    if not blocks:
-        print("  No active temporary blocks.")
-        return
-
-    now = time.time()
-    print(f"\n  {'IP':<20} {'Expires':<22} {'Remaining':<14} Comment")
-    print(f"  {'─'*20} {'─'*22} {'─'*14} {'─'*20}")
-    for b in sorted(blocks, key=lambda x: x.expires_at):
-        remaining = b.expires_at - now
-        exp = datetime.datetime.fromtimestamp(b.expires_at).strftime("%Y-%m-%d %H:%M:%S")
-        rem = _fmt_duration(int(remaining))
-        print(f"  {RED}{b.ip:<20}{RESET} {exp:<22} {rem:<14} {b.comment}")
-    print()
+def cmd_temp_list(args: argparse.Namespace) -> None:
+    ui.query("temp-list", args, [])
 
 
 def cmd_temp_remove(args: argparse.Namespace) -> None:
     _require_root()
     ip = _resolve(args.ip)
+    record = state.load()
+    if ip not in record.temp_blocks:
+        _ok(f"No change: {ip} has no temporary block. Permanent blocks were not touched.")
+        return
+    if ip in record.deny_meta:
+        raise ValueError("IP also has a permanent ban; use --deny-remove to review/remove it.")
     _info(f"Removing temporary block for {ip}...")
 
     nft.undeny(ip)
@@ -589,8 +464,8 @@ def cmd_temp_remove(args: argparse.Namespace) -> None:
     cfg.remove_deny(ip)
 
     c = cfg.load_config()
-    if c.crowdsec_enabled and crowdsec.available():
-        crowdsec.delete_decision(ip)
+    if c.crowdsec_enabled and shutil.which("cscli"):
+        _sync_failed(crowdsec.delete_decision(ip), "removal")
 
     _ok(f"Temporary block removed: {ip}")
 
@@ -613,11 +488,13 @@ def cmd_allow(args: argparse.Namespace) -> None:
     # Remove from deny if present
     nft.undeny(ip)
     cfg.remove_deny(ip)
+    state.remove_temp_block(ip)
+    state.remove_deny_meta(ip)
 
     # Remove CrowdSec ban if any
     c = cfg.load_config()
-    if c.crowdsec_enabled and crowdsec.available():
-        crowdsec.delete_decision(ip)
+    if c.crowdsec_enabled and shutil.which("cscli"):
+        _sync_failed(crowdsec.delete_decision(ip), "removal")
 
     _ok(f"Allowed: {ip}{f'  ({comment})' if comment else ''}")
 
@@ -625,111 +502,19 @@ def cmd_allow(args: argparse.Namespace) -> None:
 def cmd_allow_remove(args: argparse.Namespace) -> None:
     _require_root()
     ip = _resolve(args.ip)
+    _protect_admin(args, ip)
     _info(f"Removing {ip} from whitelist...")
 
-    nft.unallow(ip)
-    cfg.remove_allow(ip)
+    removed = nft.unallow(ip)
+    configured = cfg.remove_allow(ip)
     state.remove_allow_meta(ip)
 
-    _ok(f"Removed from whitelist: {ip}")
+    _ok(f"Removed from whitelist: {ip}" if removed or configured else
+        f"No change: {ip} was not in the local allow list.")
 
 
 def cmd_grep(args: argparse.Namespace) -> None:
-    target = args.target
-    c = cfg.load_config()
-
-    # Resolve domain to IPs if needed
-    ips_to_check: list[str] = []
-    try:
-        ipaddress.ip_address(target)
-        ips_to_check = [target]
-    except ValueError:
-        # It's a hostname — resolve it
-        try:
-            infos = socket.getaddrinfo(target, None)
-            ips_to_check = list({str(i[4][0]) for i in infos})
-            _info(f"Resolved {target} → {', '.join(ips_to_check)}")
-        except socket.gaierror:
-            _err(f"Could not resolve: {target}")
-            sys.exit(1)
-
-    _header(f"Search: {target}")
-    found = False
-
-    for ip in ips_to_check:
-        print(f"\n{BOLD}IP: {ip}{RESET}")
-
-        # nftables allow set
-        if nft.table_exists():
-            if nft.is_allowed(ip):
-                _ok("  In fwsec ALLOW list")
-                found = True
-            if nft.is_denied(ip):
-                _warn("  In fwsec DENY list")
-                found = True
-
-        # Config files
-        allow_list = cfg.read_allow()
-        deny_list = cfg.read_deny()
-        ignore_list = cfg.read_ignore()
-
-        if any(e.ip == ip for e in allow_list):
-            _ok(f"  In {cfg.ALLOW_FILE}")
-            found = True
-        if any(e.ip == ip for e in deny_list):
-            _warn(f"  In {cfg.DENY_FILE}")
-            found = True
-        if any(e.ip == ip for e in ignore_list):
-            _info(f"  In {cfg.IGNORE_FILE}")
-            found = True
-
-        # Temp blocks
-        for t in state.list_temp_blocks():
-            if t.ip == ip:
-                exp = datetime.datetime.fromtimestamp(t.expires_at).strftime("%Y-%m-%d %H:%M:%S")
-                _warn(f"  In TEMP BLOCK list (expires {exp}) — {t.comment}")
-                found = True
-
-        # Geo policy
-        gmode = cfg.geo_mode(c)
-        if gmode != "off":
-            gcodes = c.geo_block or c.geo_allow
-            country = geo.lookup_country(ip, gcodes)
-            if nft.table_exists():
-                in_geo = (
-                    nft.element_exists("geo4", ip) or nft.element_exists("geo6", ip)
-                )
-                where = f" ({country})" if country else ""
-                if gmode == "deny" and in_geo:
-                    _warn(f"  In GEO BLOCK set{where} — traffic dropped")
-                    found = True
-                elif gmode == "allow":
-                    if in_geo:
-                        _ok(f"  In GEO ALLOW set{where} — traffic accepted")
-                        found = True
-                    else:
-                        _warn("  NOT in the geo allow set — traffic dropped (deny all)")
-                        found = True
-            elif country:
-                _info(f"  In the {gmode}-mode zones for {country} (set not loaded)")
-                found = True
-
-        # CrowdSec
-        if crowdsec.available():
-            decisions = crowdsec.grep_ip(ip)
-            for d in decisions:
-                _warn(f"  CrowdSec decision: {d.type}  reason={d.reason}  duration={d.duration}")
-                found = True
-
-        # Containers
-        for match in containers.find_ip(ip):
-            _info(f"  {match}")
-            found = True
-
-        if not found:
-            _info(f"  {ip} not found in any fwsec or CrowdSec list.")
-
-    print()
+    ui.query("search", args, [])
 
 
 def cmd_geo_update(_args: argparse.Namespace) -> None:
@@ -755,50 +540,28 @@ def cmd_geo_update(_args: argparse.Namespace) -> None:
         f"{len(g4)} IPv4 + {len(g6)} IPv6 CIDRs.")
 
     if nft.table_exists():
-        script = geo.render_apply_file(updated)
+        try:
+            transaction.validate(c, _detect_ssh_ports())
+        except ValueError as exc:
+            raise PartialFailure("Zones downloaded but NOT applied: " + str(exc)) from exc
+        # render_apply_file flushes the sets; include cached zones for failed
+        # countries too, never silently drop them from the active policy.
+        script = geo.render_apply_file(codes)
         try:
             nft._run_script(script)
             _ok("geo4/geo6 sets reloaded in nftables.")
         except RuntimeError as e:
-            _warn(f"Could not reload the geo sets: {e}")
-            _info("If the geo sets are missing from the table, run: fwsec -r")
+            raise PartialFailure(f"Zones downloaded, but NOT applied: {e}. "
+                                 "Inspect fwsec --geo-status; review fwsec --dry-run.") from e
     else:
         _info("fwsec table not loaded — run 'fwsec -s' to apply the geo policy.")
+    if failed:
+        raise PartialFailure("Only some zones were updated. "
+                             "Previous zones kept for failed countries.")
 
 
-def cmd_geo_status(_args: argparse.Namespace) -> None:
-    """Show the geo policy status."""
-    c = cfg.load_config()
-    mode = cfg.geo_mode(c)
-    codes = c.geo_block or c.geo_allow
-
-    _header("fwsec — geo policy")
-    print(f"  Mode     : {mode}")
-    if mode == "off":
-        print("  Set GEO_BLOCK or GEO_ALLOW in fwsec.conf to enable.")
-        print("  GEO_BLOCK = \"cn,ru\"  → drop the listed countries")
-        print("  GEO_ALLOW  = \"br\"    → drop everyone EXCEPT the listed countries")
-        return
-    print(f"  Countries: {', '.join(codes)}")
-    counts = geo.zone_counts(codes)
-    for cc in codes:
-        print(f"    {cc}: {counts.get(cc, 0)} CIDRs")
-    g4, g6 = geo.resolve_all(codes)
-    print(f"  Total    : {len(g4)} IPv4 + {len(g6)} IPv6 CIDRs")
-    if nft.table_exists():
-        print(f"  Loaded   : {len(nft.list_elements('geo4'))} IPv4 / "
-              f"{len(nft.list_elements('geo6'))} IPv6 elements in nftables")
-    else:
-        print("  Loaded   : fwsec table not loaded (run: fwsec -s)")
-    ts = geo.zones_last_updated()
-    if ts:
-        age_days = (time.time() - ts) / 86400
-        updated = datetime.datetime.fromtimestamp(ts)
-        print(f"  Updated  : {updated:%Y-%m-%d %H:%M} ({age_days:.1f} days ago)")
-        if age_days > 30:
-            _warn("  Zone data is stale (> 30 days). Run: fwsec --geo-update")
-    else:
-        _warn("  No zone data on disk. Run: fwsec --geo-update")
+def cmd_geo_status(args: argparse.Namespace) -> None:
+    ui.query("geo-status", args, [])
 
 
 def cmd_upgrade(_args: argparse.Namespace) -> None:
@@ -843,8 +606,7 @@ def cmd_upgrade(_args: argparse.Namespace) -> None:
 def _resolve(ip_or_host: str) -> str:
     """Resolve hostname to IP, or return IP as-is."""
     try:
-        ipaddress.ip_network(ip_or_host, strict=False)
-        return ip_or_host
+        return cfg.normalize_ip(ip_or_host)
     except ValueError:
         try:
             return socket.gethostbyname(ip_or_host)
@@ -854,13 +616,7 @@ def _resolve(ip_or_host: str) -> str:
 
 
 def _fmt_duration(sec: int) -> str:
-    if sec < 60:
-        return f"{sec}s"
-    if sec < 3600:
-        return f"{sec // 60}m {sec % 60}s"
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    return f"{h}h {m}m"
+    return ui.duration(sec)
 
 
 def _persist_nftables() -> None:
@@ -875,6 +631,7 @@ def _persist_nftables() -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="fwsec",
+        usage="fwsec ACTION [OPTIONS]",
         description="nftables + CrowdSec firewall manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -899,6 +656,18 @@ Examples:
     )
 
     g = p.add_mutually_exclusive_group()
+    g.add_argument("--status", action="store_true",
+                   help="Show actual policy and integration health")
+    g.add_argument("--menu", action="store_true", help="Open an optional read-only terminal menu")
+    p.add_argument("--json", action="store_true", help="Structured output for read-only queries")
+    p.add_argument("--verbose", action="store_true", help="Include dependency details in --version")
+    p.add_argument("--all", action="store_true", help="Show every entry with --list")
+    p.add_argument("--limit", type=int, default=10, help="Entries per --list section (default: 10)")
+    p.add_argument("--section", choices=("all", "allow", "deny", "crowdsec"), default="all",
+                   help="Filter --list to a section")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                   help="Color output (default: auto; respects NO_COLOR)")
+    p.add_argument("--yes", action="store_true", help="Acknowledge dangerous interactive actions")
 
     g.add_argument("--dry-run", action="store_true",
                    help="Validate and print the transaction without applying it (root)")
@@ -967,14 +736,88 @@ Examples:
     g.add_argument("-g", "--grep", metavar="IP_OR_DOMAIN",
                    help="Search IP or domain in all lists")
 
+    # Organize help independently from the shared mutually-exclusive action set.
+    categories = {
+        "Inspect (read-only)": {"status", "menu", "version", "list", "check", "grep",
+                                 "temp_list", "geo_status", "migration_report"},
+        "Block / allow": {"deny", "deny_remove", "temp_deny", "temp_remove", "allow",
+                          "allow_remove"},
+        "Apply / recover": {"start", "restart", "stop", "disable", "enable", "dry_run",
+                             "apply_safe", "confirm", "rollback", "adopt_legacy", "timeout"},
+        "Maintenance": {"upgrade", "geo_update", "migration_plan", "migration_finalize",
+                         "migration_approve", "migration_output"},
+    }
+    for title, names in categories.items():
+        group = p.add_argument_group(title)
+        for action in list(p._optionals._group_actions):
+            if action.dest in names:
+                p._optionals._group_actions.remove(action)
+                group._group_actions.append(action)
     return p
+
+
+def _validate_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    supplied = set(sys.argv[1:])
+    def used(name: str) -> bool:
+        return any(a == name or a.startswith(name + "=") for a in supplied)
+    if not 1 <= args.limit <= 10000:
+        parser.error("--limit must be between 1 and 10000")
+    for option in ("--all", "--limit", "--section"):
+        if used(option) and not args.list:
+            parser.error(option + " is only valid with --list")
+    if used("--timeout") and not args.apply_safe:
+        parser.error("--timeout is only valid with --apply-safe")
+    if args.apply_safe and not 30 <= args.timeout <= 3600:
+        parser.error("--timeout must be between 30 and 3600 seconds")
+    if args.adopt_legacy and not any((args.dry_run, args.apply_safe)):
+        parser.error("--adopt-legacy requires --dry-run or --apply-safe after ownership review")
+    if args.migration_approve and not args.migration_plan:
+        parser.error("--migration-approve requires --migration-plan")
+    if used("--migration-output") and not (args.migration_plan or args.migration_report):
+        parser.error("--migration-output requires --migration-plan or --migration-report")
+    if args.verbose and not args.version:
+        parser.error("--verbose is only valid with --version")
+    if args.yes and not any((args.deny, args.temp_deny, args.allow_remove,
+                             args.stop, args.disable, args.enable, args.restart, args.start)):
+        parser.error("--yes is only valid with an action that changes firewall state")
+    if args.json and not any((args.status, args.check, args.list, args.version, args.grep,
+                              args.temp_list, args.geo_status, args.migration_report)):
+        parser.error("--json requires a read-only query, e.g. --status --json")
+
+
+def cmd_menu(args: argparse.Namespace) -> None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("--menu requires an interactive terminal. Use --status or --help.")
+    choices = {"1": "status", "2": "list", "3": "temp-list", "4": "geo-status"}
+    while True:
+        print("\nfwsec — read-only menu\n"
+              "1 Status  2 Lists  3 Temporary bans  4 Geo  5 Search  0 Exit")
+        choice = input("> ").strip()
+        if choice == "0":
+            return
+        command = choices.get(choice)
+        if choice == "5":
+            args.target = input("IP / hostname: ").strip()
+            command = "search"
+        if command:
+            try:
+                ui.query(command, args, _detect_ssh_ports())
+            except (ValueError, RuntimeError, OSError) as exc:
+                _err(str(exc))
+            except SystemExit as exc:
+                if exc.code not in (3, 4):
+                    raise
+        else:
+            _warn("Choose 0–5. No changes are performed by this menu.")
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    _validate_options(parser, args)
+    ui.configure_output(args)
     try:
-        read_only = any((args.version, args.list, args.check, args.grep,
+        read_only = any((args.status, args.menu, args.version, args.list, args.check, args.grep,
                          args.geo_status, args.temp_list, args.migration_report))
         if read_only:
             _run_command(parser, args)
@@ -991,21 +834,41 @@ def main() -> None:
             "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply", "upgrade_activate",
             "migration_finalize", "migration_plan",
         )):
-            parser.print_help()
+            print("fwsec — nftables + CrowdSec firewall manager\n"
+                  "Inspect: fwsec --status | --list | --check\n"
+                  "Help:    fwsec --help | --menu\n"
+                  "Safe apply: fwsec --apply-safe (confirm from a new SSH session)")
         else:
             _require_root()
             with transaction.locked():
                 if not args.confirm and not args.rollback and not args.upgrade_activate:
                     transaction.require_no_pending()
                 _run_command(parser, args)
+    except (KeyboardInterrupt, EOFError):
+        _warn("Cancelled. If an apply was pending, its watchdog remains responsible for recovery.")
+        sys.exit(130)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
         # Configuration errors (e.g. GEO_BLOCK and GEO_ALLOW set together)
-        _err(str(e))
-        sys.exit(1)
+        if args.json:
+            print(json.dumps({"schema": 1, "ok": False, "error": str(e)}))
+        else:
+            _err(str(e))
+        sys.exit(4 if isinstance(e, PartialFailure) else 1)
 
 
 def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     # Map parsed args to command functions
+    if args.menu:
+        cmd_menu(args)
+        return
+    for flag, command in (("status", "status"), ("version", "version"), ("check", "check"),
+                          ("list", "list"), ("grep", "search"), ("temp_list", "temp-list"),
+                          ("geo_status", "geo-status"), ("migration_report", "migration-report")):
+        if getattr(args, flag, False):
+            args.target = args.grep
+            ui.query(command, args, _detect_ssh_ports() if command in (
+                "status", "check", "list") else [])
+            return
     if args.version:
         cmd_version(args)
 
@@ -1080,7 +943,7 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
 
     elif args.deny:
         comment = " ".join(args.deny[1:]) if len(args.deny) > 1 else ""
-        ns = argparse.Namespace(ip=args.deny[0], comment=comment)
+        ns = argparse.Namespace(ip=args.deny[0], comment=comment, yes=args.yes)
         cmd_deny(ns)
 
     elif args.deny_remove:
@@ -1092,6 +955,7 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
         ns = argparse.Namespace(
             ip=args.temp_deny[0],
             duration=args.temp_deny[1],
+            yes=args.yes,
             comment=" ".join(args.temp_deny[2:]) if len(args.temp_deny) > 2 else "",
         )
         cmd_temp_deny(ns)
@@ -1108,7 +972,7 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
         cmd_allow(ns)
 
     elif args.allow_remove:
-        cmd_allow_remove(argparse.Namespace(ip=args.allow_remove))
+        cmd_allow_remove(argparse.Namespace(ip=args.allow_remove, yes=args.yes))
 
     elif args.grep:
         cmd_grep(argparse.Namespace(target=args.grep))

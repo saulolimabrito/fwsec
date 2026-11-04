@@ -13,6 +13,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path("/etc/fwsec")
 EXECUTABLE = Path("/usr/local/bin/fwsec")
+APPLIED_FILE = CONFIG_DIR / "applied.json"
 CONF_FILE = CONFIG_DIR / "fwsec.conf"
 ALLOW_FILE = CONFIG_DIR / "fwsec.allow"
 DENY_FILE = CONFIG_DIR / "fwsec.deny"
@@ -212,9 +213,14 @@ def read_ignore() -> list[IpEntry]:
     return _read_ip_file(IGNORE_FILE)
 
 
+def normalize_ip(value: str) -> str:
+    net = ipaddress.ip_network(value, strict=False)
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
 def add_allow(ip: str, comment: str = "") -> None:
     entries = read_allow()
-    if any(e.ip == ip for e in entries):
+    if any(normalize_ip(e.ip) == normalize_ip(ip) for e in entries):
         return
     entries.append(IpEntry(ip=ip, comment=comment))
     _write_ip_file(ALLOW_FILE, entries)
@@ -222,7 +228,7 @@ def add_allow(ip: str, comment: str = "") -> None:
 
 def remove_allow(ip: str) -> bool:
     entries = read_allow()
-    new = [e for e in entries if e.ip != ip]
+    new = [e for e in entries if normalize_ip(e.ip) != normalize_ip(ip)]
     if len(new) == len(entries):
         return False
     _write_ip_file(ALLOW_FILE, new)
@@ -231,7 +237,7 @@ def remove_allow(ip: str) -> bool:
 
 def add_deny(ip: str, comment: str = "") -> None:
     entries = read_deny()
-    if any(e.ip == ip for e in entries):
+    if any(normalize_ip(e.ip) == normalize_ip(ip) for e in entries):
         return
     entries.append(IpEntry(ip=ip, comment=comment))
     _write_ip_file(DENY_FILE, entries)
@@ -239,7 +245,7 @@ def add_deny(ip: str, comment: str = "") -> None:
 
 def remove_deny(ip: str) -> bool:
     entries = read_deny()
-    new = [e for e in entries if e.ip != ip]
+    new = [e for e in entries if normalize_ip(e.ip) != normalize_ip(ip)]
     if len(new) == len(entries):
         return False
     _write_ip_file(DENY_FILE, new)

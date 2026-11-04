@@ -35,7 +35,7 @@ def run() -> None:
         nft._run_script(payload["rules"])
         guard = nft._run("-s", "list", "table", "inet", "host_input_guard")[1]
         for name in ("CONF_FILE", "ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "STATE_FILE",
-                     "EXECUTABLE", "MIGRATION_RECEIPT"):
+                     "EXECUTABLE", "MIGRATION_RECEIPT", "APPLIED_FILE"):
             old = getattr(config, name)
             new = root / name
             if old.exists():

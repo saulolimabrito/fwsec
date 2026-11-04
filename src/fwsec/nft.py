@@ -205,7 +205,14 @@ def add_element(set_name: str, ip: str, timeout_sec: int | None = None) -> None:
 
 
 def delete_element(set_name: str, ip: str) -> bool:
-    rc, _, _ = _run("delete", "element", NFT_FAMILY, NFT_TABLE, set_name, f"{{ {ip} }}")
+    rc, _, err = _run("delete", "element", NFT_FAMILY, NFT_TABLE, set_name, f"{{ {ip} }}")
+    if rc:
+        # A missing element is idempotent; missing table/set, permissions and
+        # backend failures are not "nothing to remove".
+        set_rc, _, set_err = _run("list", "set", NFT_FAMILY, NFT_TABLE, set_name)
+        missing = "No such file or directory" in err or "element does not exist" in err
+        if set_rc or not missing:
+            raise RuntimeError("Could not remove set entry: " + (set_err or err).strip())
     return rc == 0
 
 
