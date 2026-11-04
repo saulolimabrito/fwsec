@@ -2,11 +2,42 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/safe-apply]
   pull_request:
     branches: [main]
 
 jobs:
+  nft-integration:
+    name: Scoped transactions and detached rollback (real nftables)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y nftables iptables iproute2
+      - name: Run exclusively inside a disposable network namespace
+        run: |
+          set -o pipefail
+          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/nft_sandbox.py 2>&1 | tee /tmp/nft-test.log || {
+            echo "::error::$(tail -n 20 /tmp/nft-test.log | tr '\n' ' ')"
+            exit 1
+          }
+      - name: Verify live migration parity with real IPv4 and IPv6 packets
+        run: |
+          set -o pipefail
+          for source in ufw csf; do
+            sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/migration_sandbox.py --source "$source" 2>&1 | tee /tmp/migration-test.log || {
+              echo "::error::$(tail -n 14 /tmp/migration-test.log | tr '\n' ' ')"
+              exit 1
+            }
+          done
+      - name: Verify legacy upgrade and executable rollback
+        run: |
+          set -o pipefail
+          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/upgrade_sandbox.py 2>&1 | tee /tmp/upgrade-test.log || {
+            echo "::error::$(tail -n 25 /tmp/upgrade-test.log | tr '\n' ' ')"
+            exit 1
+          }
+
   lint:
     name: Lint (shellcheck, ruff, mypy)
     runs-on: ubuntu-latest
@@ -58,7 +89,7 @@ jobs:
           - rockylinux:9
           - fedora:latest
           - amazonlinux:2023
-          - opensuse/leap:15.6
+          - opensuse/leap:16.0
           - archlinux:latest
     container: ${{ matrix.container }}
     steps:
@@ -67,30 +98,30 @@ jobs:
           . /etc/os-release
           case "${ID}" in
             debian|ubuntu) apt-get update -qq && apt-get install -y -qq git curl ca-certificates >/dev/null ;;
-            rocky|almalinux|rhel|centos) dnf install -y -q git curl tar ca-certificates >/dev/null ;;
+            rocky|almalinux|rhel|centos) dnf install --allowerasing -y -q git curl tar ca-certificates >/dev/null ;;
             fedora) dnf install -y -q git curl tar >/dev/null ;;
-            amzn) dnf install -y -q git curl tar >/dev/null ;;
+            amzn) dnf install --allowerasing -y -q git curl tar >/dev/null ;;
             opensuse-leap|sles) zypper --non-interactive install git curl tar ca-certificates >/dev/null ;;
             arch) pacman -Sy --noconfirm git curl >/dev/null ;;
           esac
       - uses: actions/checkout@v4
-      - name: Run installer (--force, non-interactive)
-        run: bash install.sh --force
+      - name: Install code without NET_ADMIN (--install-only)
+        run: bash install.sh --force --install-only
       - name: Smoke (fwsec -v / -c)
         run: |
-          fwsec -v
-          fwsec -c
+          /usr/local/bin/fwsec -v > /tmp/fwsec-version.log 2>&1 || { cat /tmp/fwsec-version.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-version.log)"; exit 1; }
+          /usr/local/bin/fwsec -c > /tmp/fwsec-check.log 2>&1 || { cat /tmp/fwsec-check.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-check.log)"; exit 1; }
 
   install-smoke-alpine:
-    name: Install smoke — alpine:3.20 (musl + OpenRC)
+    name: Install smoke — alpine:3.22 (musl + OpenRC)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run installer inside alpine:3.20
+      - name: Run installer inside alpine:3.22
         run: |
-          docker run --rm -v "$PWD":/src -w /src alpine:3.20 sh -c '
+          docker run --rm -v "$PWD":/src -w /src alpine:3.22 sh -c '
             apk add --no-cache bash git curl tar >/dev/null &&
-            bash install.sh --force &&
+            bash install.sh --force --install-only &&
             fwsec -v &&
             fwsec -c
           '

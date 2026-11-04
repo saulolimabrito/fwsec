@@ -12,6 +12,7 @@ before the `inet filter` chain (priority 0).
 """
 from __future__ import annotations
 
+from fwsec import migration
 from fwsec.config import FwsecConfig, geo_mode
 
 FILTER_TABLE = "inet filter"
@@ -29,6 +30,33 @@ def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
     listen on several at once (main config + sshd_config.d drop-ins), and
     every one of them must stay open or you get locked out of the server.
     """
+
+    if cfg.inherited_policy:
+        migration.load(cfg.inherited_policy)
+        # The complete inherited policy is enforced in inet fwsec. The shared
+        # filter chains remain CrowdSec guards, not a second port/default policy
+        # that would silently narrow or widen the original IPv4/IPv6 rules.
+        return '''
+add table inet filter
+flush table inet filter
+table inet filter {
+    set crowdsec-blacklists { type ipv4_addr; flags timeout; }
+    set crowdsec6-blacklists { type ipv6_addr; flags timeout; }
+    chain input {
+        type filter hook input priority 0; policy accept;
+        ip saddr @crowdsec-blacklists drop
+        ip6 saddr @crowdsec6-blacklists drop
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip saddr @crowdsec-blacklists drop
+        ip6 saddr @crowdsec6-blacklists drop
+    }
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+'''
 
     # Remove SSH ports from tcp_in to avoid duplicate rules
     ssh_set = {str(p) for p in ssh_ports}
@@ -59,6 +87,14 @@ def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
     mark_accept = f"meta mark {WHITELIST_MARK_VALUE} accept" if cfg.whitelist_mark else ""
     bypass_input = f"        {mark_accept}\n" if cfg.whitelist_mark else ""
     bypass_forward = f"\n        {mark_accept}" if cfg.whitelist_mark else ""
+    output_safety = ""
+    if cfg.output_policy == "drop":
+        output_safety = '''
+        oifname "lo" accept
+        ct state established,related accept
+        ip protocol icmp accept
+        meta l4proto ipv6-icmp accept
+'''
 
     # Container mode: the forward chain must stay permissive so container
     # networking (Docker/Podman NAT) keeps working. CrowdSec bans still apply
@@ -132,7 +168,8 @@ table inet filter {{
 {forward_chain}
 
     chain output {{
-        type filter hook output priority filter; policy accept;
+        type filter hook output priority filter; policy {cfg.output_policy};
+{output_safety}
 
         # Outbound TCP
         {tcp_out_rule}
@@ -224,7 +261,9 @@ def generate_fwsec_table(cfg: FwsecConfig) -> str:
         .replace("@@ALLOW6_RULE@@", allow6_rule)
         .replace("@@MARK_ACCEPT@@", mark_accept)
         .replace("@@GEO@@", _geo_section(cfg))
-    )
+    ).rsplit("}", 1)[0] + (
+        migration.render(migration.load(cfg.inherited_policy)) if cfg.inherited_policy else ""
+    ) + "}\n"
 
 
 # Private/link-local ranges exempt from geo filtering — internal traffic

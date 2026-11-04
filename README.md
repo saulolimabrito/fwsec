@@ -41,11 +41,71 @@ sudo bash install.sh
 
 ## Updating
 
+### Safe rule application (development)
+
+Rule reloads now validate configuration, compile all fwsec rules and set
+elements, run `nft --check`, and apply one nftables transaction. A rejected
+transaction does not partially change the live firewall. Concurrent fwsec
+writers are serialized by a root-owned lock; writers are refused during a
+pending safe apply.
+
+```bash
+sudo fwsec --dry-run                  # validate/print; no rules/configuration changed
+sudo fwsec --apply-safe --timeout 120 # trial; do NOT close your original SSH session
+# Open a NEW SSH connection and confirm the ID printed by the command:
+sudo fwsec --confirm TRANSACTION_ID
+```
+
+Without confirmation the detached watchdog restores the previous fwsec
+table and affected filter chains. The watchdog is independent of the SSH
+terminal and does not require systemd (also works on OpenRC). It is not a
+reboot/power-loss recovery service: do not reboot or upgrade during a trial.
+Snapshots, confirmation/rollback status and worker logs are retained in
+`/var/lib/fwsec/transactions/<ID>/`. A failed rollback is recorded in
+`rollback-error`, retried, and continues to block other fwsec writers.
+
+**Ownership and existing installations:** only `inet fwsec` and the marked
+`input`, `forward`, `output` base chains of `inet filter` are managed. Other
+tables/chains and existing CrowdSec sets/elements are not flushed. The shared
+filter table itself is never flushed. Old installations lack ownership
+markers: inspect them first, then deliberately adopt only if those objects
+really belong to fwsec:
+
+```bash
+sudo fwsec --dry-run --adopt-legacy
+sudo fwsec --apply-safe --adopt-legacy --timeout 120
+```
+
+Do not use adoption to overwrite a third-party firewall. Normal reloads refuse
+unmarked legacy rules. During upgrade, automatic adoption is permitted only
+after proving live kernel-policy equivalence against the configured candidate.
+Custom or divergent policies refuse activation and require operator review.
+
+Boot persistence uses `/etc/nftables/fwsec.nft`, included by the distro's
+loader, with scoped/idempotent commands instead of `flush ruleset`. Existing
+administrator includes are kept. An administrator-owned loader containing a
+global flush is refused before applying rules and must be reviewed manually.
+Safe applies defer persistence until confirmation; persistence failure keeps
+rollback armed. Rollback also restores persistence/config files as captured
+at invocation (not configuration edits the operator made before invocation).
+
+Local unit tests use mocks; the separate Linux CI job runs real nftables
+only inside a disposable network namespace, including a watchdog test after
+the launching process exits. No production server is used for these tests.
+
 ```bash
 sudo fwsec --upgrade
 ```
 
-fwsec checks the GitHub repository for a newer release; when one is available it downloads it and updates the code, features, and executable. **Local configuration is never overwritten**: `fwsec.conf`, the allow/deny/ignore lists, and the temporary-block state in `/etc/fwsec` stay exactly as they are, and the rules are reloaded from them after the update. If nothing newer exists, it reports that fwsec is up to date. (`sudo bash install.sh --upgrade` remains available and does the same.)
+fwsec checks GitHub for a newer release. Version 1.5.0 stages the candidate in
+a separate environment, validates policy, provisionally applies rules, atomically
+switches the wrapper and confirms persistence. Old environments remain available;
+failed activation/confirmation restores the previous wrapper and rules. Local
+configuration and lists are preserved (the enabled state is confirmed on success).
+Unmarked legacy policies must match the configured candidate; divergence is
+refused before activation. See [release notes](RELEASE_NOTES.md) for limits.
+If nothing newer exists, it reports that fwsec is up to date.
+`sudo bash install.sh --upgrade` is also supported.
 
 ## Installation from source
 
@@ -60,9 +120,13 @@ sudo bash install.sh
 | *(no flags)* | Installs fwsec. If it is already installed, displays its status and exits. |
 | `--upgrade` | Queries the GitHub repository for the latest version. When a newer release is available, downloads it and upgrades the package and executable while preserving configuration files; otherwise reports that fwsec is up to date. |
 | `--force` | Performs a complete reinstallation. |
+| `--install-only` | Installs code/dependencies only (image building/CI); does not migrate/configure/start the firewall or alter services. |
 | `--no-crowdsec` | Installs fwsec without the CrowdSec integration (CrowdSec and its nftables bouncer can be added later; every fwsec command degrades gracefully when they are absent). |
 
-The installer also detects competing firewalls — **firewalld** and **UFW** on any supported distribution, plus legacy iptables rule-restore services (`iptables.service`, `netfilter-persistent`) — and stops, disables, and masks them, so nftables is managed exclusively by fwsec. The post-installation check fails loudly if either firewall is still active.
+The installer detects CSF, UFW and firewalld before changing their policy.
+It no longer stops/masks them or runs blanket teardown scripts during
+installation. A reviewed migration keeps its source active during a safe
+trial; unsupported/ambiguous policies abort without retiring the source.
 
 ### Interactive port selection
 
@@ -71,6 +135,13 @@ During installation, the installer scans the system with `ss` and lists every se
 - **Inbound TCP / UDP** — defaults to the detected listening services. The SSH port is detected automatically and always stays open.
 - **Outbound TCP** — suggests `80,443,53,853` (HTTP, HTTPS, DNS, DNS-over-TLS).
 - **Outbound UDP** — suggests `53,123,443` (DNS, NTP, QUIC/HTTP3).
+
+Legacy mode retains its existing OUTPUT ACCEPT behavior: these outbound
+lists are not an egress deny-by-default policy unless `OUTPUT_POLICY = drop`
+is explicitly set. That opt-in mode keeps loopback, established/related
+replies and ICMP/ICMPv6 control traffic permitted and restricts new TCP/UDP
+egress to TCP_OUT/UDP_OUT. In inherited-policy mode the original IPv4/IPv6
+OUTPUT policies and ordered egress rules are authoritative instead.
 
 At each prompt, press Enter to accept the suggestion, type a comma-separated list (ranges like `8000:8080` are allowed), or type `none`. The choices are written to `/etc/fwsec/fwsec.conf`. In non-interactive shells the detected inbound ports and the safe outbound defaults are applied automatically. If `fwsec.conf` already exists, the installer asks before reconfiguring ports.
 
@@ -85,22 +156,62 @@ The SSH port is detected separately and always stays open in either mode.
 
 ## Migrating from CSF / UFW / firewalld
 
-The installer detects an existing firewall and inherits its rules into
-fwsec automatically — the previous firewall is only removed **after** fwsec
-is up and filtering (zero-open-window order, with a full backup under
-`/root/fwsec-migration-<timestamp>/`).
+Migration uses complete **live `iptables-save` / `ip6tables-save` snapshots**,
+not a union of configured ports or a human-readable status summary. The JSON
+intermediate model preserves IPv4/IPv6, ordered actions/jumps, source and
+destination CIDRs, input/output interfaces, protocol, port ranges,
+connection states and INPUT/OUTPUT/FORWARD default policies. Thus an IPv6
+permission does not silently open IPv4, a source-specific allowance does
+not become global, and OUTPUT DROP does not become OUTPUT ACCEPT.
 
-| Source | Inherited |
-|---|---|
-| **CSF** | `TCP_IN`/`TCP_OUT`/`UDP_IN`/`UDP_OUT` (v4+v6 union — fwsec rules are family-agnostic), `csf.allow` → `fwsec.allow`, `csf.deny` → `fwsec.deny` (comments preserved) |
-| **UFW** | ALLOW IN ports → inbound lists |
-| **firewalld** | zone ports + common services (ssh, http, https, smtp, dns, …) → inbound lists |
+```bash
+sudo fwsec --migration-plan ufw --migration-output /root/migration.json
+sudo fwsec --migration-report --migration-output /root/migration.json
+# Only after reviewing the exact ownership warnings:
+sudo fwsec --migration-plan ufw --migration-output /root/migration.json \
+  --migration-approve FINGERPRINT_FROM_REPORT
+```
 
-At the end of the installation a **migration report** lists everything
-inherited and everything intentionally not inherited (CSF country ipsets —
-use `GEO_BLOCK` + `fwsec --geo-update`, ICMP rate limits, NAT/rich rules).
-Interactive installs ask before migrating; non-interactive installs
-(`curl … | sudo bash`) migrate automatically.
+The report distinguishes translated rules, ownership requiring approval,
+and unsupported rules. Approval applies only to that exact fingerprint; it
+**cannot override unsupported semantics**. NAT, raw/mangle rules, ipsets,
+rate limits, logging/reject extensions, interface wildcards, third-party
+chains and native nftables firewalld policies are conservatively blocked,
+not dropped or guessed. This first strict adapter supports a subset of
+xtables filter policies, not arbitrary firewall configurations. An active
+firewalld daemon also requires a reviewed backend-specific retirement;
+the finalizer refuses to tear it down automatically.
+
+The installer saves config/live snapshots and the complete report under
+`/root/fwsec-migration-<timestamp>.<random>/`. If the plan is ready, it sets
+`INHERITED_POLICY = /etc/fwsec/inherited.json` and starts a **120-second safe
+trial**. Existing fwsec configurations are never implicitly merged. Multiple
+sources or unidentified active hooks/rules are refused. A source needing
+ownership approval can be retried with
+`bash install.sh --migration-approve=FINGERPRINT`; the fingerprint is rechecked.
+
+After applying a ready policy:
+
+```bash
+# From a NEW SSH session, confirm the transaction ID printed by the installer:
+sudo fwsec --confirm TRANSACTION_ID
+sudo fwsec --migration-report
+sudo fwsec --migration-finalize
+```
+
+Finalization requires the exact confirmed policy to remain active and the
+source snapshots to remain unchanged. Both retirement batches are checked
+first. Retirement uses `iptables-restore --noflush` / `ip6tables-restore
+--noflush` with exact rule deletions and only reviewed source-chain names;
+there is no global `-F`, `-X`, uninstall script or ruleset flush. Source
+startup is disabled without executing its firewall teardown (LFD is stopped;
+CSF cron entries are backed up). Packages/configs remain for recovery. A
+failure is reported, never presented as a successful complete migration.
+
+With `INHERITED_POLICY` active, that snapshot is authoritative for ports and
+directional defaults; changing legacy TCP_IN/OUT fields does not edit the
+inherited policy. CrowdSec remains an additional protection layer. The
+normal non-migration default configuration is unchanged.
 
 ## Quick reference
 

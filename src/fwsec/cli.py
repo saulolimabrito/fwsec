@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import ipaddress
+import json
 import re
 import shutil
 import socket
@@ -17,7 +18,19 @@ import sys
 import time
 from pathlib import Path
 
-from fwsec import __version__, containers, crowdsec, geo, nft, rules, state, upgrade
+from fwsec import (
+    __version__,
+    compat,
+    containers,
+    crowdsec,
+    geo,
+    migration,
+    nft,
+    rules,
+    state,
+    transaction,
+    upgrade,
+)
 from fwsec import config as cfg
 
 # ---------------------------------------------------------------------------
@@ -173,7 +186,7 @@ def cmd_version(_args: argparse.Namespace) -> None:
         print(out.strip())
 
 
-def cmd_start(_args: argparse.Namespace) -> None:
+def cmd_start(_args: argparse.Namespace) -> str | None:
     _require_root()
     _info("Starting fwsec firewall...")
 
@@ -185,96 +198,66 @@ def cmd_start(_args: argparse.Namespace) -> None:
 
     c = cfg.load_config()
 
-    # Safety gate: an allow-mode policy with empty country sets is a
-    # deny-everything firewall — it would drop SSH and lock everyone out.
-    if cfg.geo_mode(c) == "allow":
-        c4, c6 = geo.resolve_all(c.geo_allow)
-        if not c4 and not c6:
-            _err("GEO_ALLOW is configured but no zone data is on disk "
-                 "(run: fwsec --geo-update).")
-            _err("Refusing to apply a deny-all policy with empty country sets.")
-            sys.exit(1)
-
     ssh_ports = _detect_ssh_ports()
-    ssh_label = ", ".join(str(p) for p in ssh_ports)
-
-    # Build and apply filter table
-    filter_script = rules.generate_filter_table(c, ssh_ports)
-    try:
-        nft._run_script(filter_script)
-        _ok(f"inet filter table loaded (SSH port{'s' if len(ssh_ports) > 1 else ''}: {ssh_label}).")
-    except RuntimeError as e:
-        _err(f"Failed to load filter table: {e}")
-        sys.exit(1)
-
-    # Build and apply fwsec table (flush first to avoid set conflicts on re-start)
-    if nft.table_exists():
-        nft.flush_table()
-    fwsec_script = rules.generate_fwsec_table(c)
-    try:
-        nft._run_script(fwsec_script)
-        _ok("inet fwsec table loaded.")
-    except RuntimeError as e:
-        _err(f"Failed to load fwsec table: {e}")
-        sys.exit(1)
-
-    # Populate sets from config files
-    allow_entries = cfg.read_allow()
-    deny_entries = cfg.read_deny()
-    nft.load_allow_list([e.ip for e in allow_entries])
-    nft.load_deny_list([e.ip for e in deny_entries])
-
-    # Restore temp blocks that are still active
-    temp = state.list_temp_blocks()
-    for t in temp:
-        remaining = int(t.expires_at - time.time())
-        if remaining > 0:
-            try:
-                nft.deny(t.ip, remaining)
-            except (ValueError, RuntimeError):
-                pass
-
-    # Geo policy (deny/allow) — bulk load the country sets in one nft -f
-    mode = cfg.geo_mode(c)
-    if mode != "off":
-        codes = c.geo_block or c.geo_allow
-        g4, g6 = geo.resolve_all(codes)
-        if not g4 and not g6:
-            _warn(f"Geo policy ({mode}) configured but no zone data on disk. "
-                  "Run: fwsec --geo-update")
-        else:
-            script = geo.render_apply_file(codes)
-            try:
-                nft._run_script(script)
-                _ok(f"Geo policy ({mode}): {', '.join(codes)} — "
-                    f"{len(g4)} IPv4 + {len(g6)} IPv6 CIDRs loaded.")
-            except RuntimeError as e:
-                _err(f"Failed to load the geo sets: {e}")
-        if mode == "allow":
-            _warn("GEO ALLOW MODE: traffic from outside "
-                  f"[{', '.join(codes)}] is dropped at priority -40.")
-            _warn("Admin IPs in fwsec.allow always override geo — verify yours is listed.")
-
-    _ok(f"Allow list: {len(allow_entries)} IPs, Deny list: {len(deny_entries)} IPs, "
-        f"Temp blocks: {len(temp)} IPs.")
-
-    # Container support
-    runtimes = containers.detect_runtimes()
-    if runtimes and not c.container_mode:
-        _warn(f"Container runtime detected ({', '.join(runtimes)}) but CONTAINER_MODE = 0.")
-        _warn("The forward chain drops everything — container networking will break.")
-        _warn(f"Set CONTAINER_MODE = 1 in {cfg.CONF_FILE} and run: fwsec -r")
-    elif c.container_mode:
-        _ok(f"Container mode enabled (policy: {c.container_policy}).")
-        if c.container_policy == "filtered":
-            _apply_container_filter()
-
-    # Mark enabled
-    cfg.set_enabled(True)
-
-    # Persist ruleset
-    _persist_nftables()
-    _ok("fwsec started.")
+    transaction.validate(c, ssh_ports)
+    if c.inherited_policy and not getattr(_args, "dry_run", False):
+        digest = migration.fingerprint(migration.load(c.inherited_policy))
+        receipt = json.loads(cfg.MIGRATION_RECEIPT.read_text()) if (
+            cfg.MIGRATION_RECEIPT.exists()) else {}
+        if receipt.get("digest") != digest and not getattr(_args, "apply_safe", False):
+            raise ValueError("An unconfirmed inherited policy requires --apply-safe, not -s/-r.")
+    transaction.loader_content()  # refuse unsafe persistence before changing kernel rules
+    before = transaction.snapshot(adopt=(getattr(_args, "adopt_legacy", False)
+                                        or getattr(_args, "upgrade_apply", False)))
+    extra = ""
+    if c.container_mode and c.container_policy == "filtered":
+        published = containers.externally_published_ports()
+        extra = rules.generate_container_filter(
+            [p.host_port for p in published if p.proto == "tcp"],
+            [p.host_port for p in published if p.proto == "udp"],
+            containers.container_networks(),
+        )
+    script = transaction.build(c, ssh_ports, before, extra)
+    if getattr(_args, "upgrade_apply", False):
+        if not c.enabled or not before["fwsec"] or len(before["chains"]) != 3:
+            raise RuntimeError("Automatic upgrade requires an enabled, active fwsec installation")
+        if not _args.upgrade_state:
+            raise ValueError("--upgrade-apply requires --upgrade-state PATH")
+        try:
+            transaction.snapshot()
+        except RuntimeError:
+            probe = transaction.build(c, ssh_ports, {"fwsec": "", "chains": {}}, extra)
+            compat.prove(c, probe, filtered=bool(extra))
+        _args.apply_safe = True
+        _args.timeout = 180
+    if getattr(_args, "dry_run", False):
+        transaction.check(script)
+        print(script)
+        return None
+    timeout = _args.timeout if getattr(_args, "apply_safe", False) else None
+    ident = transaction.apply(script, before, timeout)
+    if ident:
+        if getattr(_args, "upgrade_apply", False):
+            transaction.atomic_write(_args.upgrade_state, ident)
+        if c.inherited_policy:
+            transaction.atomic_write(transaction.ROOT / ident / "migration.json", json.dumps({
+                "path": str(c.inherited_policy),
+                "digest": migration.fingerprint(migration.load(c.inherited_policy)),
+                "source": migration.load(c.inherited_policy)["source"],
+            }))
+        _warn(f"Rules applied provisionally. Automatic rollback in {_args.timeout}s.")
+        _info(f"From a NEW SSH connection confirm: fwsec --confirm {ident}")
+        _info("Boot persistence is unchanged until confirmation.")
+    else:
+        try:
+            _persist_nftables()
+            cfg.set_enabled(True)
+        except (OSError, RuntimeError):
+            nft._run_script(transaction.restore_script(before))
+            transaction.restore_files(before)
+            raise
+        _ok("fwsec started (one validated atomic transaction).")
+    return ident
 
 
 def _apply_container_filter() -> None:
@@ -301,30 +284,16 @@ def _apply_container_filter() -> None:
 
 def cmd_stop(_args: argparse.Namespace) -> None:
     _require_root()
-    _info("Stopping fwsec (flushing fwsec table, restoring permissive filter)...")
-    nft.flush_table()
-
-    # Replace filter table with a permissive ruleset (everything allowed)
-    permissive = """
-flush table inet filter
-table inet filter {
-    chain input {
-        type filter hook input priority filter; policy accept;
-    }
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-    }
-    chain output {
-        type filter hook output priority filter; policy accept;
-    }
-}
-"""
-    try:
-        nft._run_script(permissive)
-    except RuntimeError as e:
-        _warn(f"Could not flush filter table: {e}")
-
-    _ok("fwsec stopped. All traffic is now allowed.")
+    before = transaction.snapshot(adopt=getattr(_args, "adopt_legacy", False))
+    script = "delete table inet fwsec\n" if before["fwsec"] else ""
+    for name in before["chains"]:
+        script += f"flush chain inet filter {name}\n"
+        script += (f"add chain inet filter {name} {{ type filter hook {name} "
+                   f'priority 0; policy accept; comment "{transaction.MARKER}"; }}\n')
+    if script:
+        transaction.check(script)
+        nft._run_script(script)
+    _ok("fwsec stopped. Third-party rules and CrowdSec sets were not removed.")
 
 
 def cmd_disable(_args: argparse.Namespace) -> None:
@@ -336,15 +305,12 @@ def cmd_disable(_args: argparse.Namespace) -> None:
 
 def cmd_enable(_args: argparse.Namespace) -> None:
     _require_root()
-    cfg.set_enabled(True)
-    _ok("fwsec enabled.")
     cmd_start(_args)
 
 
 def cmd_restart(_args: argparse.Namespace) -> None:
     _require_root()
     _info("Restarting fwsec...")
-    nft.flush_table()
     cmd_start(_args)
     _ok("fwsec restarted.")
 
@@ -352,7 +318,12 @@ def cmd_restart(_args: argparse.Namespace) -> None:
 def cmd_check(_args: argparse.Namespace) -> None:
     _header("fwsec configuration check")
     c = cfg.load_config()
+    transaction.validate(c, _detect_ssh_ports())
     issues = 0
+    if c.inherited_policy:
+        policy = migration.load(c.inherited_policy)
+        _ok(f"Inherited policy: {policy['source']} ({policy['summary']['rules']} ordered rules)")
+        _info("IPv4/IPv6 and input/output/forward policies come from INHERITED_POLICY.")
 
     # Config file
     if not cfg.CONF_FILE.exists():
@@ -370,6 +341,8 @@ def cmd_check(_args: argparse.Namespace) -> None:
     # TCP_IN ports
     _ok(f"TCP_IN  : {', '.join(c.tcp_in) or '(none)'}")
     _ok(f"TCP_OUT : {', '.join(c.tcp_out) or '(none)'}")
+    _ok("OUTPUT policy: " + ("per-family inherited policy" if c.inherited_policy
+                              else c.output_policy.upper()))
 
     # Allow/deny files
     allow_list = cfg.read_allow()
@@ -458,6 +431,9 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
     # Allowed ports (from fwsec.conf; SSH is detected and always open)
     c = cfg.load_config()
+    if c.inherited_policy:
+        print(migration.report_text(migration.load(c.inherited_policy)))
+        _info("Legacy TCP_IN/OUT defaults below are not used while INHERITED_POLICY is active.")
     ssh_ports = _detect_ssh_ports()
 
     def _ports(plist: list[str]) -> str:
@@ -467,6 +443,9 @@ def cmd_list(_args: argparse.Namespace) -> None:
     print(f"  {CYAN}TCP IN {RESET} : {', '.join(str(p) for p in ssh_ports)} (SSH)"
           f"{', ' + _ports(c.tcp_in) if c.tcp_in else ''}")
     print(f"  {CYAN}TCP OUT{RESET} : {_ports(c.tcp_out)}")
+    print(f"  {CYAN}OUTPUT POLICY{RESET}: " + (
+        "inherited (see report)" if c.inherited_policy else c.output_policy.upper()
+    ))
     print(f"  {CYAN}UDP IN {RESET} : {_ports(c.udp_in)}")
     print(f"  {CYAN}UDP OUT{RESET} : {_ports(c.udp_out)}")
     print(f"  {CYAN}ICMP IN{RESET} : {'yes' if c.icmp_in else 'no'}")
@@ -850,7 +829,9 @@ def cmd_upgrade(_args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _info("Local configuration in /etc/fwsec (fwsec.conf, allow/deny/ignore "
-          "lists, state) is preserved — only code and executable are updated.")
+           "lists, state) is preserved — only code and executable are updated.")
+    sys.stdout.flush()
+    sys.stderr.flush()
     rc = subprocess.call(["bash", str(installer), "--upgrade"])
     sys.exit(rc)
 
@@ -882,77 +863,9 @@ def _fmt_duration(sec: int) -> str:
     return f"{h}h {m}m"
 
 
-NFTABLES_CONF_DEBIAN = Path("/etc/nftables.conf")
-NFTABLES_CONF_RHEL = Path("/etc/sysconfig/nftables.conf")
-NFTABLES_RHEL_INCLUDE = Path("/etc/nftables/fwsec.nft")
-_FWSEC_MARKER = "# Managed by fwsec"
-
-
-def _nftables_conf_path() -> Path:
-    """Config file loaded by the distribution's nftables.service.
-
-    RHEL-family and SUSE load /etc/sysconfig/nftables.conf; Debian, Ubuntu,
-    Arch and Alpine load /etc/nftables.conf. Writing the wrong file silently
-    loses the rules at every reboot.
-    """
-    if NFTABLES_CONF_RHEL.exists():
-        return NFTABLES_CONF_RHEL
-    return NFTABLES_CONF_DEBIAN
-
-
 def _persist_nftables() -> None:
-    """Save fwsec's tables for persistence across reboots.
-
-    Only the tables fwsec owns are saved — persisting the full ruleset would
-    freeze dynamic rules from other owners (Docker, Podman, libvirt) and
-    restore stale copies of them at boot.
-
-    Debian-family: /etc/nftables.conf is the file nftables.service loads;
-    write the tables there directly.
-
-    RHEL-family/SUSE: /etc/sysconfig/nftables.conf is an admin-owned include
-    list that may pull in other rule files (management guards, NAT helpers).
-    Write the tables to /etc/nftables/fwsec.nft and make sure the loader
-    includes that file instead of clobbering the admin's includes. When the
-    loader was previously written wholesale by fwsec, refresh it in place.
-    """
-    out = nft.list_fwsec_tables()
-    if not out:
-        return
-
-    body = "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\nflush ruleset\n\n" + out
-
-    if NFTABLES_CONF_RHEL.exists():
-        NFTABLES_RHEL_INCLUDE.parent.mkdir(parents=True, exist_ok=True)
-        NFTABLES_RHEL_INCLUDE.write_text(
-            "#!/usr/sbin/nft -f\n" + _FWSEC_MARKER + "\n\n" + out
-        )
-
-        conf = NFTABLES_CONF_RHEL
-        content = conf.read_text(errors="replace") if conf.exists() else ""
-        if _FWSEC_MARKER in content:
-            # Loader previously written wholesale by fwsec: refresh in place.
-            conf.write_text(body)
-            return
-        include_line = f'include "{NFTABLES_RHEL_INCLUDE}"'
-        if include_line not in content:
-            if content.strip():
-                backup = conf.parent / (conf.name + ".fwsec.bak")
-                shutil.copy2(conf, backup)
-            content = content.rstrip("\n") + "\n" + include_line + "\n" if content \
-                else "#!/usr/sbin/nft -f\n" + include_line + "\n"
-            conf.write_text(content)
-        return
-
-    conf = NFTABLES_CONF_DEBIAN
-    if conf.exists():
-        content = conf.read_text(errors="replace")
-        if _FWSEC_MARKER not in content:
-            # First fwsec write over a foreign config — keep a backup
-            backup = conf.parent / (conf.name + ".fwsec.bak")
-            shutil.copy2(conf, backup)
-
-    conf.write_text(body)
+    """Persist only fwsec-owned objects, without any global ruleset flush."""
+    transaction.persist()
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +899,32 @@ Examples:
     )
 
     g = p.add_mutually_exclusive_group()
+
+    g.add_argument("--dry-run", action="store_true",
+                   help="Validate and print the transaction without applying it (root)")
+    g.add_argument("--apply-safe", action="store_true",
+                   help="Apply provisionally; roll back unless confirmed from a new SSH session")
+    g.add_argument("--confirm", metavar="ID", help="Confirm a pending safe apply")
+    g.add_argument("--rollback", metavar="ID",
+                   help="Cancel a pending apply and restore its snapshot")
+    g.add_argument("--upgrade-apply", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--upgrade-activate", metavar="ID", help=argparse.SUPPRESS)
+    p.add_argument("--upgrade-state", type=Path, help=argparse.SUPPRESS)
+    g.add_argument("--migration-report", action="store_true",
+                   help="Show the complete inherited-policy report")
+    g.add_argument("--migration-plan", choices=("csf", "ufw", "firewalld"),
+                   help="Capture and classify live policy without changing rules")
+    g.add_argument("--migration-finalize", action="store_true",
+                   help="Retire exact legacy rules after safe-apply confirmation")
+    p.add_argument("--migration-output", type=Path,
+                   default=Path("/var/lib/fwsec/migration-plan.json"),
+                   help="Path for a live migration plan/report")
+    p.add_argument("--migration-approve", default="",
+                   help="Explicitly approve the exact source fingerprint after ownership review")
+    p.add_argument("--timeout", type=int, default=120,
+                   help="Safe-apply confirmation deadline in seconds (30–3600)")
+    p.add_argument("--adopt-legacy", action="store_true",
+                   help="Explicitly adopt unmarked fwsec tables/chains after inspecting them")
 
     g.add_argument("-v", "--version",   action="store_true", help="Show version")
     g.add_argument("--upgrade",         action="store_true",
@@ -1035,8 +974,31 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        _run_command(parser, args)
-    except ValueError as e:
+        read_only = any((args.version, args.list, args.check, args.grep,
+                         args.geo_status, args.temp_list, args.migration_report))
+        if read_only:
+            _run_command(parser, args)
+        elif args.upgrade:
+            # The installer invokes fwsec -r as a child; don't hold a lock
+            # across that subprocess. Still refuse an upgrade during a trial.
+            _require_root()
+            with transaction.locked():
+                transaction.require_no_pending()
+            cmd_upgrade(args)
+        elif not any(vars(args).get(k) for k in (
+            "start", "restart", "enable", "stop", "disable", "deny", "deny_remove",
+            "temp_deny", "temp_remove", "allow", "allow_remove", "geo_update",
+            "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply", "upgrade_activate",
+            "migration_finalize", "migration_plan",
+        )):
+            parser.print_help()
+        else:
+            _require_root()
+            with transaction.locked():
+                if not args.confirm and not args.rollback and not args.upgrade_activate:
+                    transaction.require_no_pending()
+                _run_command(parser, args)
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
         # Configuration errors (e.g. GEO_BLOCK and GEO_ALLOW set together)
         _err(str(e))
         sys.exit(1)
@@ -1046,6 +1008,45 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
     # Map parsed args to command functions
     if args.version:
         cmd_version(args)
+
+    elif args.confirm:
+        transaction.confirm(args.confirm)
+        _ok("Safe apply confirmed and persisted.")
+
+    elif args.rollback:
+        transaction.rollback(args.rollback)
+        _ok("Previous rules, persistence and wrapper restored.")
+
+    elif args.upgrade_activate:
+        transaction.activate_upgrade(args.upgrade_activate)
+        _ok("Candidate wrapper activated and upgrade confirmed.")
+
+    elif args.migration_report:
+        c = cfg.load_config()
+        path = c.inherited_policy or args.migration_output
+        print(migration.report_text(json.loads(path.read_text())))
+
+    elif args.migration_plan:
+        document = migration.capture(args.migration_plan, args.migration_output,
+                                     args.migration_approve)
+        print(migration.report_text(document))
+        if document["status"] != "ready":
+            raise ValueError("Migration is blocked or requires fingerprint approval; "
+                             "nothing changed.")
+
+    elif args.migration_finalize:
+        c = cfg.load_config()
+        if not c.inherited_policy or not cfg.MIGRATION_RECEIPT.exists():
+            raise ValueError("No confirmed inherited policy is available")
+        policy = migration.load(c.inherited_policy)
+        receipt = json.loads(cfg.MIGRATION_RECEIPT.read_text())
+        migration.finalize(policy, receipt)
+        _ok("Exact reviewed legacy rules retired; configuration/packages retained for recovery.")
+        _info("Old startup disabled without a global flush; "
+              "packages/configs retained for recovery.")
+
+    elif args.dry_run or args.apply_safe or args.upgrade_apply:
+        cmd_start(args)
 
     elif args.upgrade:
         cmd_upgrade(args)
