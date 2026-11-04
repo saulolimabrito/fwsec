@@ -163,6 +163,50 @@ def restore_timeouts(before: dict[str, Any]) -> str:
     return text
 
 
+def ownership_rule(rule: dict[str, Any]) -> bool:
+    """Only an inert anonymous-counter sentinel is a portable ownership claim."""
+    expr = rule.get("expr", [])
+    return bool(rule.get("comment") == MARKER and len(expr) == 1
+                and isinstance(expr[0], dict) and set(expr[0]) == {"counter"}
+                and isinstance(expr[0]["counter"], dict)
+                and set(expr[0]["counter"]) <= {"packets", "bytes"})
+
+
+def owns_chain(table: str, chain: dict[str, Any],
+               rows: list[dict[str, Any]] | None = None) -> bool:
+    """Old nft JSON omits chain comments; accept only a scoped declaration.
+
+    An arbitrary rule comment is NOT a chain ownership claim; only the exact
+    inert first-rule sentinel is accepted on kernels lacking chain userdata.
+    nft's canonical text prints chain comments on a standalone declaration line.
+    """
+    if "comment" in chain:
+        return bool(chain["comment"] == MARKER)
+    if rows is not None:
+        first: dict[str, Any] = next((o["rule"] for o in rows if "rule" in o
+                      and o["rule"].get("family") == "inet"
+                      and o["rule"].get("table") == table
+                      and o["rule"].get("chain") == chain["name"]), {})
+        if ownership_rule(first):
+            return True
+    text = _dump("chain", "inet", table, chain["name"])
+    depth = 0
+    scoped = False
+    for line in text.splitlines():
+        if depth == 1 and line.strip() == f'chain {chain["name"]} {{':
+            scoped = True
+        if scoped and depth == 2 and re.fullmatch(
+            r'\s*comment\s+"' + re.escape(MARKER) + r'"\s*;?\s*', line
+        ):
+            return True
+        # Quoted strings may themselves contain braces, e.g. rule comments.
+        unquoted = re.sub(r'"(?:\\.|[^"\\])*"', '', line)
+        depth += unquoted.count("{") - unquoted.count("}")
+        if depth < 2:
+            scoped = False
+    return False
+
+
 def snapshot(adopt: bool = False) -> dict[str, Any]:
     objects = _objects()
     tables = {o["table"]["name"] for o in objects
@@ -174,14 +218,14 @@ def snapshot(adopt: bool = False) -> dict[str, Any]:
                  and o["chain"]["family"] == "inet" and o["chain"]["table"] == "fwsec"]
     if not adopt:
         for name in CHAINS:
-            if name in chains and chains[name].get("comment") != MARKER:
+            if name in chains and not owns_chain("filter", chains[name], objects):
                 raise RuntimeError(
                     f"inet filter/{name} has no fwsec ownership marker. "
                     "Inspect --dry-run, then use --adopt-legacy only if these chains "
                     "belong to fwsec. Third-party chains must not be adopted."
                 )
         if "fwsec" in tables and not any(
-            ch.get("name") == "whitelist" and ch.get("comment") == MARKER
+            ch.get("name") == "whitelist" and owns_chain("fwsec", ch, objects)
             for ch in fw_chains
         ):
             raise RuntimeError("inet fwsec is unmarked; inspect before --adopt-legacy.")
@@ -214,6 +258,9 @@ def build(c: config.FwsecConfig, ssh_ports: list[int], before: dict[str, Any],
     filt = filt.replace("flush table inet filter", "# Shared table is never flushed")
     for name in CHAINS:
         filt = filt.replace(f"chain {name} {{", f'chain {name} {{\n        comment "{MARKER}"')
+    sentinel = f'\n        counter comment "{MARKER}"'
+    declaration = r'(type filter hook (?:input|forward|output) priority [^;]+; policy [^;]+;)'
+    filt = re.sub(declaration, lambda m: m.group(1) + sentinel, filt)
     prefix = ""
     if before["fwsec"]:
         prefix += "delete table inet fwsec\n"
@@ -224,6 +271,7 @@ def build(c: config.FwsecConfig, ssh_ports: list[int], before: dict[str, Any],
     fw = rules.generate_fwsec_table(c).replace(
         "chain whitelist {", f'chain whitelist {{\n        comment "{MARKER}"'
     )
+    fw = re.sub(declaration, lambda m: m.group(1) + sentinel, fw, count=1)
     script = prefix + filt + fw
     record = state.load()
     permanent = {ipaddress.ip_network(e.ip, strict=False) for e in record.deny_meta.values()}

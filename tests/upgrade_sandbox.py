@@ -17,6 +17,7 @@ def run() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         config.CONFIG_DIR = root
+        config.STATE_FILE = root / "state"
         config.CONF_FILE = root / "fwsec.conf"
         config.ALLOW_FILE = root / "allow"
         config.DENY_FILE = root / "deny"

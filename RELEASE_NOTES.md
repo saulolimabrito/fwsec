@@ -1,4 +1,16 @@
-# fwsec 1.5.0
+# fwsec 1.5.1
+
+## Legacy nftables hotfix
+
+- nftables 1.0.2/1.0.4 omit chain comments from JSON, and some old kernels
+  discard chain comments altogether. Add a portable, inert first-rule sentinel
+  (anonymous counter plus exact comment, no verdict). Validate its exact shape
+  and position; arbitrary rule comments never authorize ownership. Retain a
+  strict scoped text fallback for existing chain declarations.
+- Report already-completed rollback accurately instead of claiming a worker
+  remains armed. Do not retry 1.5.0; upgrade to 1.5.1 instead.
+
+## Included from 1.5.0
 
 - Checked atomic nftables application, detached rollback and serialized CLI writers.
 - Confirmation defers persistence; rollback retains remaining temporary-ban life.

@@ -27,6 +27,8 @@ def run() -> None:
         config.IGNORE_FILE = base / "ignore"
         config.CONF_FILE = base / "fwsec.conf"
         config.STATE_FILE = base / "state"
+        config.EXECUTABLE = base / "fwsec-wrapper"
+        config.MIGRATION_RECEIPT = base / "receipt"
         transaction.ROOT = base / "transactions"
         transaction.LOCK = base / "lock"
         transaction.LOADER_DEBIAN = base / "nftables.conf"

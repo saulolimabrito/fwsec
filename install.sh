@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-FWSEC_VERSION="1.5.0"
+FWSEC_VERSION="1.5.1"
 REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"
@@ -993,8 +993,16 @@ run_upgrade() {
         die "Candidate refused; previous executable and rules are retained (or watchdog rollback is armed)."
     ident=$(cat "${candidate}/transaction-id")
     if ! "${runtime}/bin/fwsec" --upgrade-activate "$ident"; then
-        "${runtime}/bin/fwsec" --rollback "$ident" || warn "Rollback worker remains armed; inspect transaction logs."
-        die "Upgrade confirmation failed; previous code/rules restored or rollback remains armed."
+        if [[ -f "/var/lib/fwsec/transactions/${ident}/rolled-back" ]]; then
+            warn "Rollback already completed; previous code/rules restored."
+        elif "${runtime}/bin/fwsec" --rollback "$ident"; then
+            warn "Rollback completed; previous code/rules restored."
+        elif [[ -f "/var/lib/fwsec/transactions/${ident}/pending" ]]; then
+            warn "Rollback remains pending; inspect transaction logs immediately."
+        else
+            warn "Recovery state unknown; inspect transaction logs immediately."
+        fi
+        die "Upgrade confirmation failed; upgrade NOT completed."
     fi
     rm -rf "$(dirname "$src_dir")"
     ok "fwsec upgraded to ${remote}. Configuration files were preserved."

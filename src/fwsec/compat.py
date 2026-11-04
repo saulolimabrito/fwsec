@@ -118,6 +118,9 @@ def objects(rows: list[dict[str, Any]], table: str, name: str,
             elif kind == "rule":
                 if chain not in result["chains"]:
                     raise RuntimeError("Unexpected nft JSON ordering while checking legacy policy")
+                if (not result["chains"][chain]["rules"]
+                        and transaction.ownership_rule(item)):
+                    continue
                 result["chains"][chain]["rules"].append(normalize(item))
             elif kind == "set":
                 result["sets"][item["name"]] = normalize(item)

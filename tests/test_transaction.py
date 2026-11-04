@@ -33,6 +33,42 @@ class TransactionTests(unittest.TestCase):
             with self.subTest(ports=ports), self.assertRaises(ValueError):
                 transaction.validate(config.FwsecConfig(tcp_in=ports), [22])
 
+    def test_old_nft_chain_ownership_text_fallback(self):
+        text = ('table inet filter {\n\tchain input {\n'
+                f'\t\tcomment "{transaction.MARKER}"\n'
+                '\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n')
+        with patch.object(transaction, "_dump", return_value=text) as dump:
+            self.assertTrue(transaction.owns_chain("filter", {"name": "input"}))
+        dump.assert_called_once_with("chain", "inet", "filter", "input")
+
+    def test_rule_comment_cannot_claim_chain_ownership(self):
+        for rule in (f'counter comment "{transaction.MARKER}"',
+                     f'ip saddr {{ 192.0.2.1 }} accept comment "{transaction.MARKER}"',
+                     'comment "administrator"', ''):
+            text = f'table inet filter {{\n chain input {{\n  {rule}\n }}\n}}\n'
+            with patch.object(transaction, "_dump", return_value=text):
+                self.assertFalse(transaction.owns_chain("filter", {"name": "input"}))
+
+    def test_json_ownership_is_authoritative_when_present(self):
+        with patch.object(transaction, "_dump") as dump:
+            self.assertTrue(transaction.owns_chain("filter", {
+                "name": "input", "comment": transaction.MARKER}))
+            self.assertFalse(transaction.owns_chain("filter", {
+                "name": "input", "comment": "administrator"}))
+        dump.assert_not_called()
+
+    def test_portable_sentinel_requires_inert_first_rule(self):
+        marker = {"family": "inet", "table": "filter", "chain": "input",
+                  "comment": transaction.MARKER, "expr": [{"counter": {"packets": 0, "bytes": 0}}]}
+        with patch.object(transaction, "_dump", return_value=""):
+            self.assertTrue(transaction.owns_chain("filter", {"name": "input"}, [{"rule": marker}]))
+            other = {**marker, "expr": [{"accept": None}]}
+            self.assertFalse(transaction.owns_chain("filter", {"name": "input"}, [{"rule": other}]))
+            rows = [{"rule": {**marker, "comment": "other"}}, {"rule": marker}]
+            self.assertFalse(transaction.owns_chain("filter", {"name": "input"}, rows))
+        self.assertFalse(transaction.ownership_rule({**marker, "expr": [
+            {"counter": {"name": "administrator"}}]}))
+
     def test_invalid_ip_in_file_rejected(self):
         config.ALLOW_FILE.write_text("not-an-ip # test\n")
         with self.assertRaisesRegex(ValueError, "Invalid IP/CIDR"):
