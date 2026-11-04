@@ -81,6 +81,12 @@ unmarked legacy rules. During upgrade, automatic adoption is permitted only
 after proving live kernel-policy equivalence against the configured candidate.
 Custom or divergent policies refuse activation and require operator review.
 
+Use **1.5.1 or newer**, not 1.5.0, on legacy nftables. Some old kernels discard
+chain comments and older nft JSON omits them. Portable ownership uses an inert
+first-rule anonymous counter with the exact fwsec marker, without a verdict;
+ordinary rule comments cannot authorize adoption. Linux CI tests old distro
+nftables with real transactions, not only code installation.
+
 Boot persistence uses `/etc/nftables/fwsec.nft`, included by the distro's
 loader, with scoped/idempotent commands instead of `flush ruleset`. Existing
 administrator includes are kept. An administrator-owned loader containing a

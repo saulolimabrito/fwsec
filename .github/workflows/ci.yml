@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feature/safe-apply]
+    branches: [main, feature/safe-apply, fix/nft-legacy-ownership]
   pull_request:
     branches: [main]
 
@@ -37,6 +37,34 @@ jobs:
             echo "::error::$(tail -n 25 /tmp/upgrade-test.log | tr '\n' ' ')"
             exit 1
           }
+
+  legacy-nft:
+    name: Real legacy nftables — ${{ matrix.container }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [ubuntu:22.04, rockylinux:8]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise adoption, confirmation, persistence and rollback with distro nft
+        run: |
+          docker run --rm --privileged -v "$PWD":/src -w /src "${{ matrix.container }}" bash -ec '
+            . /etc/os-release
+            case "$ID" in
+              ubuntu) apt-get update -qq; apt-get install -y -qq curl ca-certificates iptables iproute2 ;;
+              rocky) dnf install --allowerasing -y -q curl ca-certificates iptables iproute ;;
+            esac
+            bash install.sh --install-only
+            export PYTHONPATH=/src/src
+            nft --version
+            for test in nft_sandbox.py upgrade_sandbox.py; do
+              unshare --net /opt/fwsec/venv/bin/python "tests/$test"
+            done
+            for source in ufw csf; do
+              unshare --net /opt/fwsec/venv/bin/python tests/migration_sandbox.py --source "$source"
+            done
+          '
 
   lint:
     name: Lint (shellcheck, ruff, mypy)
