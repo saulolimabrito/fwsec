@@ -78,10 +78,11 @@ table inet host_input_guard {
         assert ident and (root / "id").read_text() == ident
         assert config.EXECUTABLE.read_text() == "old installed wrapper"
         transaction.snapshot()  # ownership markers now exist
-        transaction.atomic_write(config.EXECUTABLE, "new candidate wrapper")
         with transaction.locked():
-            transaction.confirm(ident)
-        assert config.EXECUTABLE.read_text() == "new candidate wrapper"
+            transaction.activate_upgrade(ident)
+        candidate_wrapper = config.EXECUTABLE.read_text()
+        assert ' -m fwsec "$@"' in candidate_wrapper
+        assert config.EXECUTABLE.stat().st_mode & 0o777 == 0o755
         assert not transaction.pending()
         assert nft.element_exists("allow4", "192.0.2.1")
         assert foreign == nft._run("-s", "list", "table", "inet", "host_input_guard")[1]
@@ -94,7 +95,7 @@ table inet host_input_guard {
             assert ident
             transaction.atomic_write(config.EXECUTABLE, "broken wrapper activation")
             transaction.rollback(ident)
-        assert config.EXECUTABLE.read_text() == "new candidate wrapper"
+        assert config.EXECUTABLE.read_text() == candidate_wrapper
         assert not nft.element_exists("allow4", "203.0.113.7")
         assert (old_venv / "sentinel").exists()
         print("PASS: equivalent legacy adoption, custom-policy refusal, management guard, "

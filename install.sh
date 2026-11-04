@@ -992,11 +992,7 @@ run_upgrade() {
     "${runtime}/bin/fwsec" --upgrade-apply --upgrade-state "${candidate}/transaction-id" || \
         die "Candidate refused; previous executable and rules are retained (or watchdog rollback is armed)."
     ident=$(cat "${candidate}/transaction-id")
-    if ! FWSEC_RUNTIME="$runtime" install_binary; then
-        "${runtime}/bin/fwsec" --rollback "$ident" || warn "Rollback worker remains armed; inspect transaction logs."
-        die "Executable activation failed; upgrade not completed."
-    fi
-    if ! "$BIN" --confirm "$ident"; then
+    if ! "${runtime}/bin/fwsec" --upgrade-activate "$ident"; then
         "${runtime}/bin/fwsec" --rollback "$ident" || warn "Rollback worker remains armed; inspect transaction logs."
         die "Upgrade confirmation failed; previous code/rules restored or rollback remains armed."
     fi

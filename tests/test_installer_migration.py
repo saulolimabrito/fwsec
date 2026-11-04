@@ -73,7 +73,7 @@ migration_backup() { mkdir -p "$MIGRATION_BACKUP"; }
         self.assertNotIn("install_fwsec_package", upgrade)
         self.assertIn("${INSTALL_DIR}/releases", upgrade)
         self.assertIn("--upgrade-apply", upgrade)
-        self.assertIn('--confirm "$ident"', upgrade)
+        self.assertIn('--upgrade-activate "$ident"', upgrade)
         self.assertIn('--rollback "$ident"', upgrade)
 
 

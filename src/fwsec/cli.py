@@ -908,6 +908,7 @@ Examples:
     g.add_argument("--rollback", metavar="ID",
                    help="Cancel a pending apply and restore its snapshot")
     g.add_argument("--upgrade-apply", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--upgrade-activate", metavar="ID", help=argparse.SUPPRESS)
     p.add_argument("--upgrade-state", type=Path, help=argparse.SUPPRESS)
     g.add_argument("--migration-report", action="store_true",
                    help="Show the complete inherited-policy report")
@@ -987,14 +988,14 @@ def main() -> None:
         elif not any(vars(args).get(k) for k in (
             "start", "restart", "enable", "stop", "disable", "deny", "deny_remove",
             "temp_deny", "temp_remove", "allow", "allow_remove", "geo_update",
-            "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply",
+            "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply", "upgrade_activate",
             "migration_finalize", "migration_plan",
         )):
             parser.print_help()
         else:
             _require_root()
             with transaction.locked():
-                if not args.confirm and not args.rollback:
+                if not args.confirm and not args.rollback and not args.upgrade_activate:
                     transaction.require_no_pending()
                 _run_command(parser, args)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
@@ -1015,6 +1016,10 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
     elif args.rollback:
         transaction.rollback(args.rollback)
         _ok("Previous rules, persistence and wrapper restored.")
+
+    elif args.upgrade_activate:
+        transaction.activate_upgrade(args.upgrade_activate)
+        _ok("Candidate wrapper activated and upgrade confirmed.")
 
     elif args.migration_report:
         c = cfg.load_config()

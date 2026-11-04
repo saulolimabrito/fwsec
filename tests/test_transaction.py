@@ -253,6 +253,30 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(config.EXECUTABLE.stat().st_mode & 0o777, 0o755)
         self.assertTrue((directory / "rolled-back").exists())
 
+    def test_upgrade_cannot_activate_after_rollback_or_expiry(self):
+        config.EXECUTABLE.write_text("old wrapper")
+        ident, directory = self.trial()
+        (directory / "pending").write_text(str(time.monotonic() - 1))
+        with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+            transaction.activate_upgrade(ident)
+        (directory / "pending").rename(directory / "rolled-back")
+        with self.assertRaisesRegex(RuntimeError, "no longer"):
+            transaction.activate_upgrade(ident)
+        self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
+
+    def test_upgrade_activation_failure_restores_wrapper(self):
+        config.EXECUTABLE.write_text("old wrapper")
+        self.before["files"] = transaction.snapshot_files()
+        ident, directory = self.trial()
+        with patch.object(transaction, "confirm", side_effect=RuntimeError("persist failed")), \
+                patch.object(transaction, "restore_script", return_value="restore"), \
+                patch.object(transaction, "check"), patch("fwsec.nft._run_script"):
+            with transaction.locked():
+                with self.assertRaisesRegex(RuntimeError, "persist failed"):
+                    transaction.activate_upgrade(ident)
+        self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
+        self.assertTrue((directory / "rolled-back").exists())
+
     def test_no_watchdog_means_no_apply(self):
         with patch.object(transaction, "check"), patch("subprocess.Popen", return_value=Mock()), \
                 patch("time.sleep"), patch("fwsec.nft._run_script") as apply:

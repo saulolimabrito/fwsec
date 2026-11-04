@@ -428,6 +428,29 @@ def confirm(ident: str) -> None:
     marker.rename(directory / "confirmed")
 
 
+def activate_upgrade(ident: str) -> None:
+    """Caller holds locked(); never switch a wrapper after watchdog rollback."""
+    directory = _directory(ident)
+    marker = directory / "pending"
+    if not marker.exists() or not (directory / "applied").exists():
+        raise RuntimeError("Upgrade is no longer awaiting activation")
+    if time.monotonic() >= float(marker.read_text()):
+        raise RuntimeError("Upgrade deadline expired; wrapper activation refused")
+    interpreter = Path(sys.executable)
+    if not interpreter.is_file() or not interpreter.is_absolute():
+        raise RuntimeError("Invalid candidate interpreter")
+    # JSON quoting is not shell quoting: use shlex for paths with spaces/quotes.
+    import shlex
+    wrapper = '#!/usr/bin/env bash\nexec ' + shlex.quote(str(interpreter)) + ' -m fwsec "$@"\n'
+    try:
+        atomic_write(config.EXECUTABLE, wrapper)
+        config.EXECUTABLE.chmod(0o755)
+        confirm(ident)
+    except BaseException:
+        rollback(ident)
+        raise
+
+
 def watchdog(ident: str) -> None:
     directory = _directory(ident)
     atomic_write(directory / "ready", "yes")
