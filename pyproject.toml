@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fwsec"
-version = "1.6.0"
+version = "1.6.1"
 description = "nftables + CrowdSec firewall manager — CSF-style CLI"
 readme = "README.md"
 license = "GPL-2.0-only"
