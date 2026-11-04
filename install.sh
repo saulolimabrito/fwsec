@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-FWSEC_VERSION="1.4.0"
+FWSEC_VERSION="1.5.0"
 REPO="saulolimabrito/fwsec"
 INSTALL_DIR="/opt/fwsec"
 CONFIG_DIR="/etc/fwsec"
@@ -734,11 +734,22 @@ install_config_files() {
 # =============================================================================
 install_binary() {
     info "Installing the executable at ${BIN}..."
-    cat > "$BIN" << WRAPPER
+    local runtime="${FWSEC_RUNTIME:-${INSTALL_DIR}/venv}" wrapper
+    mkdir -p "$(dirname "$BIN")" || return 1
+    [[ ! -L "$BIN" && -x "${runtime}/bin/python" ]] || return 1
+    wrapper=$(mktemp "${BIN}.XXXXXX") || return 1
+    if ! cat > "$wrapper" << WRAPPER
 #!/usr/bin/env bash
-exec "${INSTALL_DIR}/venv/bin/python" -m fwsec "\$@"
+exec "${runtime}/bin/python" -m fwsec "\$@"
 WRAPPER
-    chmod +x "$BIN"
+    then
+        rm -f "$wrapper"
+        return 1
+    fi
+    chmod 755 "$wrapper" && mv -f "$wrapper" "$BIN" || {
+        rm -f "$wrapper"
+        return 1
+    }
     ok "Executable installed: ${BIN}."
 }
 
@@ -966,13 +977,30 @@ run_upgrade() {
 
     install_python
     install_uv
-    install_fwsec_package
-    install_binary
-    rm -rf "$(dirname "$src_dir")"
+    [[ "$(command -v fwsec)" == "$BIN" ]] || die "Unexpected fwsec executable path; review before upgrading."
+    local candidate runtime ident
+    mkdir -p "${INSTALL_DIR}/releases"
+    candidate=$(mktemp -d "${INSTALL_DIR}/releases/${remote}.XXXXXX")
+    chmod 755 "$candidate"
+    runtime="${candidate}/venv"
+    uv venv "$runtime" --python "${PYTHON:-3.11}" --quiet
+    uv pip install --quiet "$SCRIPT_DIR" --python "${runtime}/bin/python"
+    [[ "$("${runtime}/bin/python" -c 'from fwsec import __version__; print(__version__)')" == "$remote" ]] || \
+        die "Candidate version does not match the release; installed code is unchanged."
 
-    echo ""
-    info "Reloading rules with the new version..."
-    fwsec -r || die "Code installed, but rule reload was refused/failed. Existing rules were not intentionally flushed; inspect before retrying."
+    info "Validating ownership/legacy equivalence before activating the new package..."
+    "${runtime}/bin/fwsec" --upgrade-apply --upgrade-state "${candidate}/transaction-id" || \
+        die "Candidate refused; previous executable and rules are retained (or watchdog rollback is armed)."
+    ident=$(cat "${candidate}/transaction-id")
+    if ! FWSEC_RUNTIME="$runtime" install_binary; then
+        "${runtime}/bin/fwsec" --rollback "$ident" || warn "Rollback worker remains armed; inspect transaction logs."
+        die "Executable activation failed; upgrade not completed."
+    fi
+    if ! "$BIN" --confirm "$ident"; then
+        "${runtime}/bin/fwsec" --rollback "$ident" || warn "Rollback worker remains armed; inspect transaction logs."
+        die "Upgrade confirmation failed; previous code/rules restored or rollback remains armed."
+    fi
+    rm -rf "$(dirname "$src_dir")"
     ok "fwsec upgraded to ${remote}. Configuration files were preserved."
     fwsec -v
     echo ""

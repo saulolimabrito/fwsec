@@ -20,6 +20,7 @@ from pathlib import Path
 
 from fwsec import (
     __version__,
+    compat,
     containers,
     crowdsec,
     geo,
@@ -185,7 +186,7 @@ def cmd_version(_args: argparse.Namespace) -> None:
         print(out.strip())
 
 
-def cmd_start(_args: argparse.Namespace) -> None:
+def cmd_start(_args: argparse.Namespace) -> str | None:
     _require_root()
     _info("Starting fwsec firewall...")
 
@@ -206,7 +207,8 @@ def cmd_start(_args: argparse.Namespace) -> None:
         if receipt.get("digest") != digest and not getattr(_args, "apply_safe", False):
             raise ValueError("An unconfirmed inherited policy requires --apply-safe, not -s/-r.")
     transaction.loader_content()  # refuse unsafe persistence before changing kernel rules
-    before = transaction.snapshot(adopt=getattr(_args, "adopt_legacy", False))
+    before = transaction.snapshot(adopt=(getattr(_args, "adopt_legacy", False)
+                                        or getattr(_args, "upgrade_apply", False)))
     extra = ""
     if c.container_mode and c.container_policy == "filtered":
         published = containers.externally_published_ports()
@@ -216,13 +218,27 @@ def cmd_start(_args: argparse.Namespace) -> None:
             containers.container_networks(),
         )
     script = transaction.build(c, ssh_ports, before, extra)
+    if getattr(_args, "upgrade_apply", False):
+        if not c.enabled or not before["fwsec"] or len(before["chains"]) != 3:
+            raise RuntimeError("Automatic upgrade requires an enabled, active fwsec installation")
+        if not _args.upgrade_state:
+            raise ValueError("--upgrade-apply requires --upgrade-state PATH")
+        try:
+            transaction.snapshot()
+        except RuntimeError:
+            probe = transaction.build(c, ssh_ports, {"fwsec": "", "chains": {}}, extra)
+            compat.prove(c, probe, filtered=bool(extra))
+        _args.apply_safe = True
+        _args.timeout = 180
     if getattr(_args, "dry_run", False):
         transaction.check(script)
         print(script)
-        return
+        return None
     timeout = _args.timeout if getattr(_args, "apply_safe", False) else None
     ident = transaction.apply(script, before, timeout)
     if ident:
+        if getattr(_args, "upgrade_apply", False):
+            transaction.atomic_write(_args.upgrade_state, ident)
         if c.inherited_policy:
             transaction.atomic_write(transaction.ROOT / ident / "migration.json", json.dumps({
                 "path": str(c.inherited_policy),
@@ -241,6 +257,7 @@ def cmd_start(_args: argparse.Namespace) -> None:
             transaction.restore_files(before)
             raise
         _ok("fwsec started (one validated atomic transaction).")
+    return ident
 
 
 def _apply_container_filter() -> None:
@@ -812,7 +829,9 @@ def cmd_upgrade(_args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _info("Local configuration in /etc/fwsec (fwsec.conf, allow/deny/ignore "
-          "lists, state) is preserved — only code and executable are updated.")
+           "lists, state) is preserved — only code and executable are updated.")
+    sys.stdout.flush()
+    sys.stderr.flush()
     rc = subprocess.call(["bash", str(installer), "--upgrade"])
     sys.exit(rc)
 
@@ -886,6 +905,10 @@ Examples:
     g.add_argument("--apply-safe", action="store_true",
                    help="Apply provisionally; roll back unless confirmed from a new SSH session")
     g.add_argument("--confirm", metavar="ID", help="Confirm a pending safe apply")
+    g.add_argument("--rollback", metavar="ID",
+                   help="Cancel a pending apply and restore its snapshot")
+    g.add_argument("--upgrade-apply", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--upgrade-state", type=Path, help=argparse.SUPPRESS)
     g.add_argument("--migration-report", action="store_true",
                    help="Show the complete inherited-policy report")
     g.add_argument("--migration-plan", choices=("csf", "ufw", "firewalld"),
@@ -964,13 +987,14 @@ def main() -> None:
         elif not any(vars(args).get(k) for k in (
             "start", "restart", "enable", "stop", "disable", "deny", "deny_remove",
             "temp_deny", "temp_remove", "allow", "allow_remove", "geo_update",
-            "dry_run", "apply_safe", "confirm", "migration_finalize", "migration_plan",
+            "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply",
+            "migration_finalize", "migration_plan",
         )):
             parser.print_help()
         else:
             _require_root()
             with transaction.locked():
-                if not args.confirm:
+                if not args.confirm and not args.rollback:
                     transaction.require_no_pending()
                 _run_command(parser, args)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
@@ -987,6 +1011,10 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
     elif args.confirm:
         transaction.confirm(args.confirm)
         _ok("Safe apply confirmed and persisted.")
+
+    elif args.rollback:
+        transaction.rollback(args.rollback)
+        _ok("Previous rules, persistence and wrapper restored.")
 
     elif args.migration_report:
         c = cfg.load_config()
@@ -1012,7 +1040,7 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
         _info("Old startup disabled without a global flush; "
               "packages/configs retained for recovery.")
 
-    elif args.dry_run or args.apply_safe:
+    elif args.dry_run or args.apply_safe or args.upgrade_apply:
         cmd_start(args)
 
     elif args.upgrade:

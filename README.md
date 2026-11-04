@@ -76,9 +76,10 @@ sudo fwsec --dry-run --adopt-legacy
 sudo fwsec --apply-safe --adopt-legacy --timeout 120
 ```
 
-Do not use adoption to overwrite a third-party firewall. This development
-change intentionally refuses an unattended reload of unmarked legacy rules;
-it must be tested and adopted before a production upgrade can be released.
+Do not use adoption to overwrite a third-party firewall. Normal reloads refuse
+unmarked legacy rules. During upgrade, automatic adoption is permitted only
+after proving live kernel-policy equivalence against the configured candidate.
+Custom or divergent policies refuse activation and require operator review.
 
 Boot persistence uses `/etc/nftables/fwsec.nft`, included by the distro's
 loader, with scoped/idempotent commands instead of `flush ruleset`. Existing
@@ -96,7 +97,15 @@ the launching process exits. No production server is used for these tests.
 sudo fwsec --upgrade
 ```
 
-fwsec checks the GitHub repository for a newer release; when one is available it downloads it and updates the code, features, and executable. **Local configuration is never overwritten**: `fwsec.conf`, the allow/deny/ignore lists, and the temporary-block state in `/etc/fwsec` stay exactly as they are, and the rules are reloaded from them after the update. If nothing newer exists, it reports that fwsec is up to date. (`sudo bash install.sh --upgrade` remains available and does the same.)
+fwsec checks GitHub for a newer release. Version 1.5.0 stages the candidate in
+a separate environment, validates policy, provisionally applies rules, atomically
+switches the wrapper and confirms persistence. Old environments remain available;
+failed activation/confirmation restores the previous wrapper and rules. Local
+configuration and lists are preserved (the enabled state is confirmed on success).
+Unmarked legacy policies must match the configured candidate; divergence is
+refused before activation. See [release notes](RELEASE_NOTES.md) for limits.
+If nothing newer exists, it reports that fwsec is up to date.
+`sudo bash install.sh --upgrade` is also supported.
 
 ## Installation from source
 

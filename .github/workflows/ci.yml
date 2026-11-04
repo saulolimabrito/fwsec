@@ -30,6 +30,13 @@ jobs:
               exit 1
             }
           done
+      - name: Verify legacy upgrade and executable rollback
+        run: |
+          set -o pipefail
+          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/upgrade_sandbox.py 2>&1 | tee /tmp/upgrade-test.log || {
+            echo "::error::$(tail -n 25 /tmp/upgrade-test.log | tr '\n' ' ')"
+            exit 1
+          }
 
   lint:
     name: Lint (shellcheck, ruff, mypy)

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_DIR = Path("/etc/fwsec")
+EXECUTABLE = Path("/usr/local/bin/fwsec")
 CONF_FILE = CONFIG_DIR / "fwsec.conf"
 ALLOW_FILE = CONFIG_DIR / "fwsec.allow"
 DENY_FILE = CONFIG_DIR / "fwsec.deny"

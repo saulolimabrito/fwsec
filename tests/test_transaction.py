@@ -16,7 +16,7 @@ class TransactionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        for name in ("ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "CONF_FILE"):
+        for name in ("ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "CONF_FILE", "EXECUTABLE"):
             p = patch.object(config, name, self.root / name)
             p.start()
             self.addCleanup(p.stop)
@@ -237,6 +237,20 @@ class TransactionTests(unittest.TestCase):
                 patch("fwsec.nft._run_script") as apply:
             transaction.watchdog(ident)
         apply.assert_called_once_with("restore")
+        self.assertTrue((directory / "rolled-back").exists())
+
+    def test_upgrade_rollback_restores_previous_wrapper(self):
+        config.EXECUTABLE.write_text("previous executable wrapper")
+        config.EXECUTABLE.chmod(0o755)
+        self.before["files"] = transaction.snapshot_files()
+        ident, directory = self.trial()
+        config.EXECUTABLE.write_text("new candidate wrapper")
+        with patch.object(transaction, "restore_script", return_value="restore"), \
+                patch.object(transaction, "check"), patch("fwsec.nft._run_script"):
+            with transaction.locked():
+                transaction.rollback(ident)
+        self.assertEqual(config.EXECUTABLE.read_text(), "previous executable wrapper")
+        self.assertEqual(config.EXECUTABLE.stat().st_mode & 0o777, 0o755)
         self.assertTrue((directory / "rolled-back").exists())
 
     def test_no_watchdog_means_no_apply(self):

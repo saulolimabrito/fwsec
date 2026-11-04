@@ -362,7 +362,7 @@ def loader_content() -> tuple[Path, str]:
 
 def snapshot_files() -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE,
+    for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE, config.EXECUTABLE,
                  config.MIGRATION_RECEIPT):
         if path.is_symlink():
             raise RuntimeError(f"Review symlinked persistence/configuration "
@@ -440,18 +440,27 @@ def watchdog(ident: str) -> None:
             if not marker.exists():
                 return
             try:
-                before = json.loads((directory / "before.json").read_text())
-                script = restore_script(before)
-                check(script)
-                nft._run_script(script)
-                restore_files(before)
-                marker.rename(directory / "rolled-back")
+                rollback(ident)
             except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
                 atomic_write(directory / "rollback-error", str(exc))
                 print(f"Rollback failed; retrying: {exc}", flush=True)
                 time.sleep(1)
                 continue
         return
+
+
+def rollback(ident: str) -> None:
+    """Caller holds locked(); restore rules, persistence and executable wrapper."""
+    directory = _directory(ident)
+    marker = directory / "pending"
+    if not marker.exists():
+        raise RuntimeError("Transaction is not awaiting confirmation")
+    before = json.loads((directory / "before.json").read_text())
+    script = restore_script(before)
+    check(script)
+    nft._run_script(script)
+    restore_files(before)
+    marker.rename(directory / "rolled-back")
 
 
 if __name__ == "__main__":

@@ -66,6 +66,16 @@ migration_backup() { mkdir -p "$MIGRATION_BACKUP"; }
                        "systemctl stop firewalld", 'rm -rf "$CSF_DIR"', "ufw --force disable"):
             self.assertNotIn(unsafe, self.script)
 
+    def test_upgrade_stages_code_and_does_not_delete_the_active_venv(self):
+        match = re.search(r"(?ms)^run_upgrade\(\) \{.*?^\}", self.script)
+        assert match
+        upgrade = match.group(0)
+        self.assertNotIn("install_fwsec_package", upgrade)
+        self.assertIn("${INSTALL_DIR}/releases", upgrade)
+        self.assertIn("--upgrade-apply", upgrade)
+        self.assertIn('--confirm "$ident"', upgrade)
+        self.assertIn('--rollback "$ident"', upgrade)
+
 
 if __name__ == "__main__":
     unittest.main()
