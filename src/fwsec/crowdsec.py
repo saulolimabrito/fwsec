@@ -42,18 +42,28 @@ class Decision:
     scope: str
 
 
-def list_decisions(ip: str | None = None) -> list[Decision]:
+def list_decisions(ip: str | None = None, strict: bool = False) -> list[Decision]:
     args = ["decisions", "list", "-o", "json"]
     if ip:
         args += ["--ip", ip]
-    rc, out, _ = _cscli(*args)
+    rc, out, err = _cscli(*args)
+    if strict and rc != 0:
+        raise RuntimeError("CrowdSec decisions unavailable: " + (err.strip() or "cscli failed"))
+    if strict and not out.strip():
+        raise RuntimeError("CrowdSec returned an empty response; decisions are unknown")
     if rc != 0 or not out.strip() or out.strip() == "null":
         return []
     try:
         raw = json.loads(out)
     except json.JSONDecodeError:
+        if strict:
+            raise RuntimeError("CrowdSec returned invalid decisions JSON") from None
         return []
     if not raw:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+        if strict:
+            raise RuntimeError("CrowdSec returned an unsupported decisions format")
         return []
     result = []
     for item in raw:
@@ -109,13 +119,18 @@ class Bouncer:
     version: str
 
 
-def list_bouncers() -> list[Bouncer]:
-    rc, out, _ = _cscli("bouncers", "list", "-o", "json")
+def list_bouncers(strict: bool = False) -> list[Bouncer]:
+    rc, out, err = _cscli("bouncers", "list", "-o", "json")
+    if strict and (rc != 0 or not out.strip()):
+        raise RuntimeError("CrowdSec bouncer status unavailable: "
+                           + (err.strip() or "empty response"))
     if rc != 0 or not out.strip() or out.strip() == "null":
         return []
     try:
         raw = json.loads(out)
     except json.JSONDecodeError:
+        if strict:
+            raise RuntimeError("CrowdSec returned invalid bouncers JSON") from None
         return []
     result = []
     for b in raw or []:

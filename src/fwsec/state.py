@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from fwsec.config import STATE_FILE
+from fwsec.config import STATE_FILE, normalize_ip
 
 
 @dataclass
@@ -65,15 +65,15 @@ def _save_raw(data: dict[str, Any]) -> None:
 def load() -> State:
     raw = _load_raw()
     temp = {
-        ip: TempEntry(**v)
+        normalize_ip(ip): TempEntry(**{**v, "ip": normalize_ip(ip)})
         for ip, v in raw.get("temp_blocks", {}).items()
     }
     allow_meta = {
-        ip: AllowEntry(**v)
+        normalize_ip(ip): AllowEntry(**{**v, "ip": normalize_ip(ip)})
         for ip, v in raw.get("allow_meta", {}).items()
     }
     deny_meta = {
-        ip: DenyEntry(**v)
+        normalize_ip(ip): DenyEntry(**{**v, "ip": normalize_ip(ip)})
         for ip, v in raw.get("deny_meta", {}).items()
     }
     return State(temp_blocks=temp, allow_meta=allow_meta, deny_meta=deny_meta)

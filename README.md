@@ -113,6 +113,59 @@ refused before activation. See [release notes](RELEASE_NOTES.md) for limits.
 If nothing newer exists, it reports that fwsec is up to date.
 `sudo bash install.sh --upgrade` is also supported.
 
+## Daily use and CLI quality (1.6.0)
+
+```bash
+sudo fwsec --status                     # Runtime, ownership, pending apply, CrowdSec
+sudo fwsec --check --json               # Same diagnostics, schema-versioned JSON
+sudo fwsec --list                       # Summary; at most 10 entries per section
+sudo fwsec --list --section deny --all  # Full selected section
+sudo fwsec --list --limit 25            # Choose the preview size
+sudo fwsec --grep 192.0.2.10 --json     # Per-address results, including CIDR membership
+sudo fwsec --temp-list                  # IPv6-safe layout, timezone and remaining duration
+sudo fwsec --menu                       # Optional read-only interactive menu
+fwsec --version                        # One-line version
+fwsec --version --verbose              # Dependencies and build details
+```
+
+The existing short aliases still work. Help is grouped by inspection, access
+lists, applying/recovering policy, and maintenance. Running without arguments
+shows a short getting-started guide, not the complete help page.
+
+**Exit codes:** `0` completed/healthy/no change; `1` operation failed; `2` invalid
+CLI options; `3` unhealthy status/check (disabled, incomplete policy, static
+drift, pending apply or unavailable required integration); `4` partial result
+or an unverified source; `130` cancelled. Update scripts that previously assumed
+`--check` always returned zero. Container/image smoke tests without NET_ADMIN
+should use `--version`, `--help` or disabled `--geo-status`, not a fake health check.
+
+JSON is supported for status/check, version, list, grep, temp-list, geo-status
+and migration-report. Output is one JSON document with `schema`, `command`,
+`ok` and `data`; runtime errors return `ok:false` and `error`. Usage errors remain
+argparse errors on stderr with exit 2. No colors are emitted into JSON or pipes.
+Use `--color=always|never|auto`; automatic color respects `NO_COLOR` and `TERM=dumb`.
+
+`--status` distinguishes configured ports from loaded policy and static-rule
+verification. A receipt in `/etc/fwsec/applied.json`, written only after apply
+and persistence succeed, detects subsequent changes to configuration or static
+kernel rules. **Dynamic set contents and end-to-end service reachability are
+outside that receipt's scope.** Missing receipts say “not verified”, never
+“verified”. CrowdSec API failures are unknown, not zero bans; operational status
+also requires a valid bouncer pull in the preceding 120 seconds.
+
+Blocking the current SSH client (including through a CIDR) and removing its
+allow entry require explicit acknowledgement. Interactive stop/disable actions
+ask for confirmation. Use `--yes` only after reviewing the target; non-interactive
+self-targeting operations are refused without it. Temporary durations must be
+positive seconds. Removing an absent local entry reports “No change”; integration
+failures report partial success rather than an unconditional OK.
+
+Stop/disable retain CrowdSec and third-party rules. Disabled installations stay
+disabled across start/restart service invocation, and stop persistence contains
+only the stopped fwsec policy. `--enable` explicitly reenables filtering.
+`--dry-run` emits only the checked nft script on stdout. Upgrades distinguish
+their automatic confirmation from a manual safe-apply/new-SSH confirmation.
+
 ## Installation from source
 
 ```bash

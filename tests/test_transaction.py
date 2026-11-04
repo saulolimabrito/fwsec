@@ -16,7 +16,8 @@ class TransactionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        for name in ("ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "CONF_FILE", "EXECUTABLE"):
+        for name in ("ALLOW_FILE", "DENY_FILE", "IGNORE_FILE", "CONF_FILE", "EXECUTABLE",
+                     "APPLIED_FILE"):
             p = patch.object(config, name, self.root / name)
             p.start()
             self.addCleanup(p.stop)
@@ -27,6 +28,9 @@ class TransactionTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.before = {"fwsec": "", "filter_exists": False, "chains": {}, "sets": []}
+        receipt = patch.object(transaction, "record_applied")
+        receipt.start()
+        self.addCleanup(receipt.stop)
 
     def test_invalid_ports_rejected(self):
         for ports in (["0"], ["65536"], ["100:20"], ["22; flush ruleset"], ["1:2:3"]):

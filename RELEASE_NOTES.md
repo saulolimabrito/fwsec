@@ -1,4 +1,24 @@
-# fwsec 1.5.1
+# fwsec 1.6.0 — CLI quality and truthful diagnostics
+
+- Grouped help, short default guide/version, filtered/bounded lists, optional
+  read-only terminal menu and schema-versioned JSON for all read-only queries.
+- New status/check separates configuration, loaded policy, ownership, static
+  drift, provisional transactions and CrowdSec API/bouncer health. Failures and
+  unknown sources no longer appear as healthy/empty.
+- Reject zero/negative temporary durations and incompatible modifiers; correct
+  multi-address/CIDR search, absent-removal messages, partial CrowdSec/Geo results.
+- No ANSI in pipes/JSON, NO_COLOR support, narrower headers, IPv6-safe temporary
+  output, ISO timestamps/timezones, day-aware durations and control-safe text.
+- SSH self-target protection and interactive stop/disable acknowledgement.
+  Real lifecycle tests also fixed disabled startup and portable stopped ownership.
+- Static apply receipts are snapshotted/restored with transactions. They do not
+  certify dynamic set contents or end-to-end reachability.
+- Exit codes are now meaningful: 0 success, 1 failure, 2 usage, 3 unhealthy check,
+  4 partial/unknown, 130 cancelled. Existing aliases remain supported.
+
+See README “Daily use and CLI quality” before updating automation using --check.
+
+## Previous fixes retained
 
 ## Legacy nftables hotfix
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feature/safe-apply, fix/nft-legacy-ownership]
+    branches: [main, feature/safe-apply, fix/nft-legacy-ownership, feature/cli-quality]
   pull_request:
     branches: [main]
 
@@ -37,6 +37,8 @@ jobs:
             echo "::error::$(tail -n 25 /tmp/upgrade-test.log | tr '\n' ' ')"
             exit 1
           }
+      - name: Exercise user-facing actions and structured queries
+        run: sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/cli_sandbox.py
 
   legacy-nft:
     name: Real legacy nftables — ${{ matrix.container }}
@@ -58,7 +60,7 @@ jobs:
             bash install.sh --install-only
             export PYTHONPATH=/src/src
             nft --version
-            for test in nft_sandbox.py upgrade_sandbox.py; do
+            for test in nft_sandbox.py upgrade_sandbox.py cli_sandbox.py; do
               unshare --net /opt/fwsec/venv/bin/python "tests/$test"
             done
             for source in ufw csf; do
@@ -101,7 +103,7 @@ jobs:
       - name: Smoke (fwsec -v / -c)
         run: |
           .venv/bin/fwsec -v
-          .venv/bin/fwsec -c
+          .venv/bin/fwsec --help
 
   install-smoke:
     name: Install smoke — ${{ matrix.container }}
@@ -138,7 +140,7 @@ jobs:
       - name: Smoke (fwsec -v / -c)
         run: |
           /usr/local/bin/fwsec -v > /tmp/fwsec-version.log 2>&1 || { cat /tmp/fwsec-version.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-version.log)"; exit 1; }
-          /usr/local/bin/fwsec -c > /tmp/fwsec-check.log 2>&1 || { cat /tmp/fwsec-check.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-check.log)"; exit 1; }
+          /usr/local/bin/fwsec --geo-status --json > /tmp/fwsec-check.log 2>&1 || { cat /tmp/fwsec-check.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-check.log)"; exit 1; }
 
   install-smoke-alpine:
     name: Install smoke — alpine:3.22 (musl + OpenRC)
@@ -151,5 +153,5 @@ jobs:
             apk add --no-cache bash git curl tar >/dev/null &&
             bash install.sh --force --install-only &&
             fwsec -v &&
-            fwsec -c
+            fwsec --geo-status --json
           '
