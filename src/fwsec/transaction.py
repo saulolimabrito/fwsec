@@ -384,12 +384,14 @@ def apply(script: str, before: dict[str, Any], timeout: int | None = None) -> st
 
 LOADER_DEBIAN = Path("/etc/nftables.conf")
 LOADER_RHEL = Path("/etc/sysconfig/nftables.conf")
+LOADER_ALPINE = Path("/etc/nftables.nft")
 INCLUDE = Path("/etc/nftables/fwsec.nft")
 PERSIST_MARKER = "# Managed by fwsec"
 
 
 def loader_content() -> tuple[Path, str]:
-    loader = LOADER_RHEL if LOADER_RHEL.exists() else LOADER_DEBIAN
+    loader = (LOADER_RHEL if LOADER_RHEL.exists() else
+              LOADER_ALPINE if LOADER_ALPINE.exists() else LOADER_DEBIAN)
     content = loader.read_text() if loader.exists() else ""
     if PERSIST_MARKER in content:
         # Replace an old fwsec-generated wholesale snapshot, including its
@@ -411,7 +413,8 @@ def loader_content() -> tuple[Path, str]:
 
 def snapshot_files() -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for path in (LOADER_DEBIAN, LOADER_RHEL, INCLUDE, config.CONF_FILE, config.EXECUTABLE,
+    for path in (LOADER_DEBIAN, LOADER_RHEL, LOADER_ALPINE, INCLUDE,
+                 config.CONF_FILE, config.EXECUTABLE,
                  config.MIGRATION_RECEIPT, config.APPLIED_FILE):
         if path.is_symlink():
             raise RuntimeError(f"Review symlinked persistence/configuration "
@@ -514,7 +517,7 @@ def confirm(ident: str) -> None:
     marker.rename(directory / "confirmed")
 
 
-def activate_upgrade(ident: str) -> None:
+def activate_upgrade(ident: str, confirm_now: bool = True) -> None:
     """Caller holds locked(); never switch a wrapper after watchdog rollback."""
     directory = _directory(ident)
     marker = directory / "pending"
@@ -527,14 +530,22 @@ def activate_upgrade(ident: str) -> None:
         raise RuntimeError("Invalid candidate interpreter")
     # JSON quoting is not shell quoting: use shlex for paths with spaces/quotes.
     import shlex
-    wrapper = '#!/usr/bin/env bash\nexec ' + shlex.quote(str(interpreter)) + ' -m fwsec "$@"\n'
+    wrapper = '#!/bin/sh\nexec ' + shlex.quote(str(interpreter)) + ' -I -B -m fwsec "$@"\n'
     try:
         atomic_write(config.EXECUTABLE, wrapper)
         config.EXECUTABLE.chmod(0o755)
-        confirm(ident)
+        verify_activation_wrapper()
+        if confirm_now:
+            confirm(ident)
     except BaseException:
         rollback(ident)
         raise
+
+
+def verify_activation_wrapper() -> None:
+    from fwsec import __version__
+    from fwsec.installer import verify_wrapper
+    verify_wrapper(config.EXECUTABLE, __version__)
 
 
 def watchdog(ident: str) -> None:

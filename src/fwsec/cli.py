@@ -213,6 +213,11 @@ def cmd_version(args: argparse.Namespace) -> None:
 
 def cmd_start(_args: argparse.Namespace) -> str | None:
     _require_root()
+    if getattr(_args, "install_apply", False):
+        _args.apply_safe = True
+        _args.timeout = 180
+        if not _args.upgrade_state:
+            raise ValueError("--install-apply requires --upgrade-state PATH")
     if not getattr(_args, "dry_run", False):
         _info("Starting fwsec firewall...")
 
@@ -241,6 +246,13 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
     transaction.loader_content()  # refuse unsafe persistence before changing kernel rules
     before = transaction.snapshot(adopt=(getattr(_args, "adopt_legacy", False)
                                         or getattr(_args, "upgrade_apply", False)))
+    if getattr(_args, "install_apply", False) and getattr(_args, "install_backup", None):
+        backup = _args.install_backup
+        files = json.loads((backup / "files.json").read_text())
+        for name, saved in files.items():
+            path = backup / saved if saved is not None else None
+            before["files"][name] = ({"text": path.read_text(),
+                                      "mode": path.stat().st_mode & 0o777} if path else None)
     extra = ""
     if c.container_mode and c.container_policy == "filtered":
         published = containers.externally_published_ports()
@@ -269,7 +281,7 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
     timeout = _args.timeout if getattr(_args, "apply_safe", False) else None
     ident = transaction.apply(script, before, timeout)
     if ident:
-        if getattr(_args, "upgrade_apply", False):
+        if getattr(_args, "upgrade_apply", False) or getattr(_args, "install_apply", False):
             transaction.atomic_write(_args.upgrade_state, ident)
         if c.inherited_policy:
             transaction.atomic_write(transaction.ROOT / ident / "migration.json", json.dumps({
@@ -678,6 +690,9 @@ Examples:
     g.add_argument("--rollback", metavar="ID",
                    help="Cancel a pending apply and restore its snapshot")
     g.add_argument("--upgrade-apply", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--install-apply", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--install-activate", metavar="ID", help=argparse.SUPPRESS)
+    p.add_argument("--install-backup", type=Path, help=argparse.SUPPRESS)
     g.add_argument("--upgrade-activate", metavar="ID", help=argparse.SUPPRESS)
     p.add_argument("--upgrade-state", type=Path, help=argparse.SUPPRESS)
     g.add_argument("--migration-report", action="store_true",
@@ -833,6 +848,7 @@ def main() -> None:
             "start", "restart", "enable", "stop", "disable", "deny", "deny_remove",
             "temp_deny", "temp_remove", "allow", "allow_remove", "geo_update",
             "dry_run", "apply_safe", "confirm", "rollback", "upgrade_apply", "upgrade_activate",
+            "install_apply", "install_activate",
             "migration_finalize", "migration_plan",
         )):
             print("fwsec — nftables + CrowdSec firewall manager\n"
@@ -842,7 +858,8 @@ def main() -> None:
         else:
             _require_root()
             with transaction.locked():
-                if not args.confirm and not args.rollback and not args.upgrade_activate:
+                if not any((args.confirm, args.rollback, args.upgrade_activate,
+                            args.install_activate)):
                     transaction.require_no_pending()
                 _run_command(parser, args)
     except (KeyboardInterrupt, EOFError):
@@ -885,6 +902,10 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
         transaction.activate_upgrade(args.upgrade_activate)
         _ok("Candidate wrapper activated and upgrade confirmed.")
 
+    elif args.install_activate:
+        transaction.activate_upgrade(args.install_activate, confirm_now=False)
+        _ok("Candidate wrapper verified; manual confirmation remains required.")
+
     elif args.migration_report:
         c = cfg.load_config()
         path = c.inherited_policy or args.migration_output
@@ -909,7 +930,7 @@ def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> N
         _info("Old startup disabled without a global flush; "
               "packages/configs retained for recovery.")
 
-    elif args.dry_run or args.apply_safe or args.upgrade_apply:
+    elif args.dry_run or args.apply_safe or args.upgrade_apply or args.install_apply:
         cmd_start(args)
 
     elif args.upgrade:

@@ -4,29 +4,32 @@
 
 fwsec is distributed and maintained as an independent project. This repository contains all source code, configuration templates, and installation resources required to use it.
 
-> Supported systems: Debian 12+ · Ubuntu 22.04+ · RHEL-family 8+ (Rocky, Alma, RHEL, CentOS Stream, Oracle Linux, Fedora 40+, Amazon Linux 2023) · openSUSE Leap 15.4+ / SLES 15 SP4+ · Arch · Alpine 3.17+
+> Linux compatibility is capability-tested; a successful code install alone does not certify firewall operation or boot persistence. CrowdSec is optional and its installation is opt-in.
 
 ## Supported distributions
 
 | Family | Distributions | Package manager | Init |
 |---|---|---|---|
-| Debian | Debian 12+, Ubuntu 22.04+, Linux Mint, Pop!_OS, Devuan, Kali, Raspbian | apt | systemd |
-| RHEL | Rocky 8+, Alma 8+, RHEL 8+, CentOS Stream 9+, Oracle Linux 8+, Fedora 40+, Amazon Linux 2023 | dnf / yum | systemd |
-| SUSE | openSUSE Leap 15.4+, Tumbleweed, SLES 15 SP4+ | zypper | systemd |
-| Arch | Arch, Manjaro, EndeavourOS | pacman | systemd |
-| Alpine | 3.17+ (musl) | apk | OpenRC |
+| Debian | Debian 12+, Ubuntu 22.04+ | apt | systemd |
+| RHEL | Rocky/Alma/RHEL/Oracle/CloudLinux 8+, CentOS Stream 9+, Fedora 43+, Amazon Linux 2023 | dnf / microdnf / yum | systemd |
+| SUSE | openSUSE Leap 16+, Tumbleweed, SLES 15 SP7+ | zypper | systemd |
+| Arch | Arch | pacman | systemd |
+| Alpine | 3.22+ (musl; main repository) | apk | OpenRC |
 
-Requirements on every distribution: **nftables ≥ 0.9.0** (kernel ≥ 4.18 — the floor of RHEL 8 / Debian 10 / Ubuntu 18.04) and **Python 3.8+**. When the distribution's Python is older than 3.8 (e.g. SLES 15), the installer provisions a standalone CPython through [uv](https://docs.astral.sh/uv/) instead — no manual step is needed. Boot persistence uses systemd, or OpenRC on Alpine; systems with neither are installed without the boot service (start fwsec manually).
+Requirements: **Python 3.8+ with SSL**, usable CA trust, nftables with JSON and check-only transaction support, kernel nf_tables features and **CAP_NET_ADMIN**. Version numbers alone are not sufficient: distro backports differ. The mutating installer can provision Python through [uv](https://docs.astral.sh/uv/) when no compatible interpreter is available. Boot integration requires a running systemd or OpenRC; other environments cannot be certified boot-ready.
 
 Notes:
 
-- Known derivatives of a supported family are allowed with a warning; EOL releases (Ubuntu ≤ 20.04, Debian ≤ 11, CentOS 7, Amazon Linux 2, Rocky/Alma/RHEL ≤ 7) are rejected.
+- Floors reviewed on **2026-11-05** are compatibility policy, not a promise of vendor security maintenance. Check subscriptions, extended support, repository/component lifecycle and architecture support separately. Older releases are rejected; derivatives and architectures outside x86_64/aarch64 need explicit `--allow-untested` (not a bypass for known unsupported releases).
+- CI separates container code-install smoke tests from real nftables namespace tests. Disposable x86_64 VMs cover full Ubuntu 24.04/systemd and Alpine 3.22/OpenRC installs and actual reboot. Other family members are not individually boot-certified; diagnostics report the testing tier.
 - Kernels without nf_tables support — **OpenVZ/Virtuozzo containers**, some stripped-down VPS kernels — cannot run fwsec; `fwsec -s` reports this explicitly instead of failing cryptically.
-- On Arch, CrowdSec is only available through the AUR; install it manually or run the installer with `--no-crowdsec`. fwsec works fully without it.
+- On Arch, CrowdSec is only available through the AUR; install it manually if wanted. fwsec's core firewall does not require CrowdSec.
 
 ## Quick install
 
-No git required — the installer downloads the latest fwsec release by itself:
+No git required — the installer downloads fwsec source by itself. It prefers the
+latest release; if that release predates the verification installer contract, it
+explicitly falls back to current `main` source (unreleased development code):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/saulolimabrito/fwsec/main/install.sh | sudo bash
@@ -176,11 +179,58 @@ sudo bash install.sh
 
 | Flag | Behavior |
 |---|---|
-| *(no flags)* | Installs fwsec. If it is already installed, displays its status and exits. |
+| *(no flags)* | Installs fwsec without installing/managing CrowdSec. Existing installs are verified rather than assumed healthy. |
 | `--upgrade` | Queries the GitHub repository for the latest version. When a newer release is available, downloads it and upgrades the package and executable while preserving configuration files; otherwise reports that fwsec is up to date. |
-| `--force` | Performs a complete reinstallation. |
+| `--force` | Stages a replacement runtime; preserves existing configuration and the old runtime. |
 | `--install-only` | Installs code/dependencies only (image building/CI); does not migrate/configure/start the firewall or alter services. |
-| `--no-crowdsec` | Installs fwsec without the CrowdSec integration (CrowdSec and its nftables bouncer can be added later; every fwsec command degrades gracefully when they are absent). |
+| `--preflight` | Read-only local dependency, distro and nftables capability checks. |
+| `--verify-only` | Read-only canonical wrapper, PATH, runtime, persistence and boot checks. Add `--install-only` to verify code only. |
+| `--json` | One installer JSON report on stdout; progress/errors go to stderr. |
+| `--python=/absolute/path` | Select an existing compatible Python/SSL interpreter. |
+| `--allow-untested` | Explicitly permit an untested derivative/architecture, still subject to capabilities. |
+| `--with-crowdsec` | Opt in to CrowdSec/bouncer package installation and configuration. |
+| `--no-crowdsec` | Do not manage CrowdSec (default); an existing integration is left intact. |
+| `--require-crowdsec` | Treat missing/unhealthy CrowdSec as a verification failure. |
+| `--adopt-vendor-loader` | Replace a global-flush loader only after package-pristine proof and backup; customized loaders are refused. |
+
+Unknown/conflicting options exit **2 before installation side effects**. Diagnostic
+modes never bootstrap/download source, install packages, configure services or apply
+host rules. Run them from an available source checkout with an existing Python/SSL,
+or use an installed `python -I -B -m fwsec.installer --mode runtime --json`.
+A standalone downloaded script cannot bootstrap itself in read-only mode.
+
+```bash
+sudo bash install.sh --preflight --json
+sudo bash install.sh --verify-only --json
+sudo bash install.sh --verify-only --install-only --json
+```
+
+Installer reports use `schema`, `state`, `exit_code`, `data`:
+
+| State | Exit | Guarantee |
+|---|---|---|
+| `CODE_INSTALLED` | 0 | Isolated Python imports and canonical/PATH version queries work; no firewall/boot certification. |
+| `PREFLIGHT_PASSED` | 0 | Local prerequisites passed; nothing installed/applied. |
+| `OPERATIONAL` | 0 | Owned policy, static receipt, persisted loader and local boot enablement verified. |
+| `READY_WITH_WARNINGS` | 4 | Requested scope passed with explicit limitations, e.g. optional integration or family-only testing. |
+| `PENDING_CONFIRMATION` | 3 | Provisional policy; open a new SSH session and confirm before its deadline. |
+| `FAILED` | 1 | Requested outcome not certified; inspect reported errors. |
+
+Installation uses versioned `/opt/fwsec/releases/` candidates and verifies the
+wrapper before confirming. File/boot recovery snapshots are retained under
+`/opt/fwsec/installer-backup.*`; transaction recovery lives in
+`/var/lib/fwsec/transactions/`. Failed builds do not delete the old runtime.
+Confirmed activations are not blindly reverted after a later diagnostic failure.
+Packages/repositories installed as dependencies (or by opt-in CrowdSec management)
+are **not automatically uninstalled** on failure. Package logs are private (mode
+600) and their path is printed on error; review them before sharing.
+
+Persistence recognizes `/etc/nftables.conf`, `/etc/sysconfig/nftables.conf` and
+Alpine's `/etc/nftables.nft`. Administrator includes and third-party rules are
+preserved; a customized global-flush loader requires manual review. SELinux and
+AppArmor policy is not automatically changed. SSL checks validate local trust,
+not external HTTPS reachability. `OPERATIONAL` is a local check, **not** proof of a
+reboot on this host or end-to-end service reachability; reboot tests run only in CI VMs.
 
 The installer detects CSF, UFW and firewalld before changing their policy.
 It no longer stops/masks them or runs blanket teardown scripts during

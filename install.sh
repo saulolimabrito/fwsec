@@ -3,8 +3,8 @@
 # =============================================================================
 # fwsec installer
 # Supported systems: Debian 12+ | Ubuntu 22.04+ | RHEL-family 8+ (Rocky, Alma,
-# RHEL, CentOS Stream, Oracle, Fedora 40+, Amazon Linux 2023) | openSUSE Leap
-# 15.4+ / SLES 15+ | Arch | Alpine 3.17+ (OpenRC)
+# RHEL, CentOS Stream, Oracle, Fedora 43+, Amazon Linux 2023) | openSUSE Leap
+# 16+ / SLES 15.7+ | Arch | Alpine 3.22+ (OpenRC)
 # =============================================================================
 set -euo pipefail
 
@@ -36,11 +36,7 @@ die()  { err "$*"; exit 1; }
 # =============================================================================
 # Initial checks
 # =============================================================================
-[[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo bash install.sh"
-if [[ -d /var/lib/fwsec/transactions ]] && \
-   [[ -n "$(find /var/lib/fwsec/transactions -mindepth 2 -maxdepth 2 -name pending -print -quit)" ]]; then
-    die "A safe apply is pending: confirm it or wait for rollback before installation/upgrade."
-fi
+# Root/pending checks are performed by main AFTER strict option parsing.
 
 # =============================================================================
 # Downloads with curl or wget (minimal distros ship only one of them)
@@ -77,35 +73,16 @@ check_already_installed() {
         installed_version=$(fwsec -v 2>/dev/null | grep '^fwsec' | awk '{print $2}' || true)
     fi
 
-    if [[ -z "$installed_version" ]]; then
+    if [[ -z "$installed_version" && ! -e "$BIN" ]]; then
         return 0  # Not installed; continue
     fi
 
-    echo ""
-    echo -e "${BOLD}${YELLOW}============================================${NC}"
-    echo -e "${BOLD}${YELLOW}  fwsec is already installed!${NC}"
-    echo -e "${BOLD}${YELLOW}============================================${NC}"
-    echo -e "  Installed version : ${BOLD}${installed_version}${NC}"
-    echo -e "  Package version   : ${BOLD}${FWSEC_VERSION}${NC}"
-    echo -e "  Executable        : $(command -v fwsec)"
-    echo -e "  Config           : ${CONFIG_DIR}/"
-    echo ""
+    info "Existing installation detected; verifying it without reinstalling."
+    local mode=runtime
+    [[ "${INSTALL_ONLY:-0}" -eq 0 ]] || mode=code
+    run_diagnostic "$mode"
+    exit $?
 
-    if [[ "$installed_version" == "$FWSEC_VERSION" ]]; then
-        echo -e "${GREEN}[OK]${NC} The installed version matches this package. Nothing to do."
-        echo ""
-        echo -e "  Check the repository for a newer release : ${BOLD}bash install.sh --upgrade${NC}"
-        echo -e "  Force reinstallation                      : ${BOLD}bash install.sh --force${NC}"
-        echo ""
-        exit 0
-    else
-        echo -e "${YELLOW}[!]${NC} A different version is installed."
-        echo ""
-        echo -e "  Upgrade from the repository : ${BOLD}bash install.sh --upgrade${NC}"
-        echo -e "  Reinstall                   : ${BOLD}bash install.sh --force${NC}"
-        echo ""
-        exit 0
-    fi
 }
 
 # =============================================================================
@@ -147,17 +124,23 @@ detect_os() {
             _family="alpine" ;;
         *)
             # Derivatives: fall back to ID_LIKE
-            case "$OS_LIKE" in
-                *debian*) _family="debian" ;;
-                *rhel*|*fedora*|*centos*) _family="rhel" ;;
-                *suse*|*sles*) _family="suse" ;;
-                *arch*) _family="arch" ;;
-                *alpine*) _family="alpine" ;;
+            case " $OS_LIKE " in
+                *" debian "*) _family="debian" ;;
+                *" rhel "*|*" fedora "*|*" centos "*) _family="rhel" ;;
+                *" suse "*|*" sles "*) _family="suse" ;;
+                *" arch "*) _family="arch" ;;
+                *" alpine "*) _family="alpine" ;;
             esac
             ;;
     esac
     [[ -n "$_family" ]] || die "Operating system '${PRETTY_NAME:-$OS_ID}' is not supported."
     OS_FAMILY="$_family"
+    OS_CONFIDENCE="known-family"
+    case "$OS_ID" in
+        debian|ubuntu|rocky|almalinux|rhel|ol|cloudlinux|centos|amzn|fedora|alpine|arch|opensuse-leap|sles|sles_sap|opensuse-tumbleweed) ;;
+        *) OS_CONFIDENCE="untested-derivative"
+           [[ "${ALLOW_UNTESTED:-0}" -eq 1 ]] || die "Untested derivative ${OS_ID}: review requirements and use --allow-untested explicitly." ;;
+    esac
 
     # Version floors — EOL releases are out of scope. Unknown derivatives of a
     # known family (own versioning scheme) are allowed with a warning.
@@ -186,26 +169,31 @@ detect_os() {
             elif [[ "$OS_ID" == "centos" ]]; then
                 [[ "$OS_MAJOR" -ge 9 ]] || die "CentOS ${OS_VERSION} is not supported. Use CentOS Stream 9/10 (CentOS 7 is EOL)."
             elif [[ "$OS_ID" == "fedora" ]]; then
-                _version_ge "$OS_VERSION" "40" || die "Fedora ${OS_VERSION} is not supported. Minimum version: 40."
+                _version_ge "$OS_VERSION" "43" || die "Fedora ${OS_VERSION} is not supported. Reviewed minimum: 43."
             else
                 _version_ge "$OS_VERSION" "8" || die "${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 8."
             fi
             ok "Detected ${PRETTY_NAME:-$OS_ID} (rhel family)."
             ;;
         suse)
-            _version_ge "$OS_VERSION" "15.4" || die "${PRETTY_NAME:-$OS_ID} ${OS_VERSION} is not supported. Minimum version: 15.4."
+            case "$OS_ID" in
+                opensuse-tumbleweed) : ;;
+                opensuse-leap) _version_ge "$OS_VERSION" "16" || die "openSUSE Leap 16+ required." ;;
+                *) _version_ge "$OS_VERSION" "15.7" || die "SLES 15.7+ with vendor maintenance required." ;;
+            esac
             ok "Detected ${PRETTY_NAME:-$OS_ID} (suse family)."
             ;;
         arch)
             ok "Detected ${PRETTY_NAME:-$OS_ID} (arch family, rolling release)."
             ;;
         alpine)
-            _version_ge "$OS_VERSION" "3.17" || die "Alpine ${OS_VERSION} is not supported. Minimum version: 3.17."
+            _version_ge "$OS_VERSION" "3.22" || die "Alpine ${OS_VERSION} is not supported. Reviewed minimum: 3.22 (main repository)."
             ok "Detected Alpine ${OS_VERSION}."
             ;;
     esac
 
     detect_pkg
+    info "OS identification confidence: ${OS_CONFIDENCE}; capability checks still required."
 }
 
 # =============================================================================
@@ -220,26 +208,30 @@ detect_pkg() {
         alpine) PKG="apk" ;;
         *)      PKG="" ;;
     esac
+    if [[ "$PKG" == dnf ]]; then
+        command -v dnf >/dev/null || { command -v microdnf >/dev/null && PKG="microdnf"; } || PKG="yum"
+    fi
+    local executable="$PKG"
+    [[ "$PKG" != apt ]] || executable="apt-get"
+    command -v "$executable" >/dev/null || die "Required package manager unavailable: ${executable}"
 }
 
 pkg_refresh() {
     case "$PKG" in
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || \
-                warn "apt-get update reported errors from an unrelated repository; continuing." ;;
-        zypper) zypper --non-interactive --quiet refresh 2>/dev/null || true ;;
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$INSTALL_LOG" 2>&1 ;;
+        zypper) zypper --non-interactive --quiet refresh >>"$INSTALL_LOG" 2>&1 ;;
         *)      true ;;  # dnf/pacman/apk refresh metadata automatically
     esac
 }
 
 pkg_install() {
+    [[ -n "${INSTALL_LOG:-}" ]] || die "Package operations require an explicit mutating installation."
     case "$PKG" in
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" 2>/dev/null ;;
-        dnf)    dnf install -y -q "$@" 2>/dev/null || \
-                yum install -y -q "$@" 2>/dev/null || \
-                microdnf install -q "$@" 2>/dev/null ;;
-        zypper) zypper --quiet --non-interactive install "$@" 2>/dev/null ;;
-        pacman) pacman -S --noconfirm --needed "$@" 2>/dev/null ;;
-        apk)    apk add --no-cache --quiet "$@" 2>/dev/null ;;
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >>"$INSTALL_LOG" 2>&1 ;;
+        dnf|yum|microdnf) "$PKG" install -y -q "$@" >>"$INSTALL_LOG" 2>&1 ;;
+        zypper) zypper --quiet --non-interactive install "$@" >>"$INSTALL_LOG" 2>&1 ;;
+        pacman) pacman -S --noconfirm --needed "$@" >>"$INSTALL_LOG" 2>&1 ;;
+        apk)    apk add --no-cache --quiet "$@" >>"$INSTALL_LOG" 2>&1 ;;
         *)      return 1 ;;
     esac
 }
@@ -248,9 +240,9 @@ pkg_install() {
 # Init system abstraction (systemd | OpenRC | none)
 # =============================================================================
 detect_init() {
-    if command -v systemctl &>/dev/null; then
+    if [[ -d /run/systemd/system ]] && command -v systemctl &>/dev/null; then
         INIT_SYSTEM="systemd"
-    elif command -v rc-service &>/dev/null; then
+    elif [[ -d /run/openrc ]] && command -v rc-service &>/dev/null; then
         INIT_SYSTEM="openrc"
     else
         INIT_SYSTEM="none"
@@ -286,17 +278,39 @@ svc_restart() {
 # =============================================================================
 install_base_deps() {
     info "Installing base dependencies (${PKG})..."
-    pkg_refresh
-    case "$OS_FAMILY" in
-        debian) pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
-        rhel)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute python3 || true ;;
-        suse)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
-        arch)   pkg_install curl tar gzip ca-certificates gnupg nftables iproute2 python || true ;;
-        alpine) pkg_install bash curl tar gzip ca-certificates gnupg nftables iproute2 python3 || true ;;
-    esac
-    command -v nft &>/dev/null || die "nftables could not be installed ('nft' binary missing)."
-    command -v tar &>/dev/null || die "tar could not be installed."
-    ok "Base dependencies installed."
+    bootstrap_deps
+    ensure_command nft nftables
+    local ip_package="iproute2"
+    [[ "$OS_FAMILY" != rhel ]] || ip_package="iproute"
+    ensure_command ip "$ip_package"
+    ensure_command ss "$ip_package"
+    if ! find_python; then
+        local python_package="python3"
+        [[ "$OS_FAMILY" != arch ]] || python_package="python"
+        pkg_install "$python_package" || warn "Distro Python unavailable; a managed runtime will be staged. See $INSTALL_LOG"
+    fi
+    ok "Required command dependencies verified (Python/SSL checked separately)."
+}
+
+ensure_command() {
+    command -v "$1" >/dev/null && return 0
+    if [[ "${PACKAGES_REFRESHED:-0}" -eq 0 ]]; then
+        pkg_refresh || die "Repository refresh failed. Inspect private log: $INSTALL_LOG"
+        PACKAGES_REFRESHED=1
+    fi
+    pkg_install "$2" || die "Could not install requirement $2. Inspect private log: $INSTALL_LOG"
+    command -v "$1" >/dev/null || die "Requirement $1 is still missing after installing $2."
+}
+
+bootstrap_deps() {
+    ensure_command tar tar
+    ensure_command gzip gzip
+    if ! command -v curl >/dev/null && ! command -v wget >/dev/null; then
+        ensure_command curl curl
+    fi
+    if [[ ! -s /etc/ssl/certs/ca-certificates.crt && ! -s /etc/pki/tls/certs/ca-bundle.crt ]]; then
+        pkg_install ca-certificates || die "CA certificates unavailable. See $INSTALL_LOG"
+    fi
 }
 
 # =============================================================================
@@ -304,12 +318,17 @@ install_base_deps() {
 # =============================================================================
 python_ok() {
     # True when $1 is a Python interpreter with version >= 3.8
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
+    "$1" -I -B -c 'import sys,ssl,fcntl,ipaddress,configparser,json; ssl.create_default_context(); raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
 }
 
 find_python() {
     local py
-    for py in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+    if [[ -n "${REQUESTED_PYTHON:-}" ]]; then
+        [[ "$REQUESTED_PYTHON" = /* ]] && python_ok "$REQUESTED_PYTHON" || die "--python requires a working absolute Python 3.8+/SSL interpreter."
+        PYTHON="$REQUESTED_PYTHON"
+        return 0
+    fi
+    for py in python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
         if command -v "$py" &>/dev/null && python_ok "$(command -v "$py")"; then
             PYTHON=$(command -v "$py")
             return 0
@@ -342,10 +361,7 @@ install_python() {
         rhel)
             if [[ "$OS_MAJOR" == "8" ]]; then
                 # Rocky/RHEL 8 provide Python 3.11 through AppStream
-                pkg_install python3.11 python3.11-pip || {
-                    pkg_install epel-release || true
-                    pkg_install python3.11 || true
-                }
+                pkg_install python3.11 python3.11-pip || true
             else
                 pkg_install python3.11 python3.11-pip || \
                 pkg_install python3.12 python3.12-pip || \
@@ -687,21 +703,25 @@ disable_competing_firewalls() {
 # Install the fwsec package in a virtual environment
 # =============================================================================
 install_fwsec_package() {
-    info "Creating a virtual environment at ${INSTALL_DIR}..."
+    info "Staging a candidate without deleting any existing runtime..."
     export PATH="/root/.local/bin:${HOME}/.local/bin:$PATH"
-
-    rm -rf "${INSTALL_DIR}/venv"
+    mkdir -p "${INSTALL_DIR}/releases"
+    CANDIDATE=$(mktemp -d "${INSTALL_DIR}/releases/${FWSEC_VERSION}.XXXXXX")
+    chmod 755 "$CANDIDATE"
+    FWSEC_RUNTIME="${CANDIDATE}/venv"
     if [[ -n "$PYTHON" ]]; then
-        uv venv "${INSTALL_DIR}/venv" --python "$PYTHON" --quiet
+        uv venv "$FWSEC_RUNTIME" --python "$PYTHON" --quiet || die "Candidate runtime creation failed; previous runtime preserved."
     else
         # uv downloads a standalone CPython (glibc or musl) when no system
         # Python satisfies the floor — works on any distribution.
-        uv venv "${INSTALL_DIR}/venv" --python 3.11 --quiet
+        uv venv "$FWSEC_RUNTIME" --python 3.11 --quiet || die "Managed candidate runtime creation failed."
     fi
 
     info "Installing fwsec ${FWSEC_VERSION}..."
     uv pip install --quiet "${SCRIPT_DIR}" \
-        --python "${INSTALL_DIR}/venv/bin/python"
+        --python "${FWSEC_RUNTIME}/bin/python" || die "Candidate build failed; previous runtime and wrapper preserved."
+    "${FWSEC_RUNTIME}/bin/python" -I -c 'import ssl,fcntl,fwsec; ssl.create_default_context()'
+    [[ "$("${FWSEC_RUNTIME}/bin/fwsec" --version)" == "fwsec ${FWSEC_VERSION}" ]] || die "Candidate version mismatch; previous runtime is unchanged."
 
     ok "fwsec installed in the virtual environment."
 }
@@ -711,7 +731,10 @@ install_fwsec_package() {
 # =============================================================================
 install_config_files() {
     info "Installing configuration files in ${CONFIG_DIR}..."
-    mkdir -p "$CONFIG_DIR"
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        chmod 750 "$CONFIG_DIR"
+    fi
 
     for f in fwsec.conf fwsec.allow fwsec.deny fwsec.ignore; do
         local src="${SCRIPT_DIR}/etc/fwsec/${f}"
@@ -720,6 +743,7 @@ install_config_files() {
             ok "  ${f}: preserved (already exists)."
         elif [[ -f "$src" ]]; then
             cp "$src" "$dst"
+            chmod 640 "$dst"
             if [[ "$f" == "fwsec.conf" ]]; then CONF_IS_NEW=1; fi
             ok "  ${f}: installed."
         else
@@ -727,11 +751,6 @@ install_config_files() {
         fi
     done
 
-    chmod 750 "$CONFIG_DIR"
-    chmod 640 "${CONFIG_DIR}"/*.conf \
-              "${CONFIG_DIR}"/*.allow \
-              "${CONFIG_DIR}"/*.deny \
-              "${CONFIG_DIR}"/*.ignore 2>/dev/null || true
 }
 
 # =============================================================================
@@ -744,8 +763,8 @@ install_binary() {
     [[ ! -L "$BIN" && -x "${runtime}/bin/python" ]] || return 1
     wrapper=$(mktemp "${BIN}.XXXXXX") || return 1
     if ! cat > "$wrapper" << WRAPPER
-#!/usr/bin/env bash
-exec "${runtime}/bin/python" -m fwsec "\$@"
+#!/bin/sh
+exec "${runtime}/bin/python" -I -B -m fwsec "\$@"
 WRAPPER
     then
         rm -f "$wrapper"
@@ -792,9 +811,9 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload || die "Could not load fwsec service definition."
     if [[ "$MIGRATION_STAGED" -ne 1 ]]; then
-        systemctl enable fwsec.service 2>/dev/null || true
+        systemctl enable fwsec.service || die "Could not enable fwsec at boot."
     fi
     ok "fwsec.service installed (boot enable is deferred during migration trials)."
 }
@@ -826,7 +845,7 @@ stop() {
 }
 UNIT
     chmod +x "$SERVICE_OPENRC"
-    [[ "$MIGRATION_STAGED" -eq 1 ]] || rc-update add fwsec default 2>/dev/null || true
+    [[ "$MIGRATION_STAGED" -eq 1 ]] || rc-update add fwsec default || die "Could not enable fwsec in OpenRC."
     ok "OpenRC service installed and added to the default runlevel."
 }
 
@@ -836,8 +855,8 @@ UNIT
 enable_nftables() {
     [[ "$MIGRATION_STAGED" -eq 0 ]] || return 0
     case "$INIT_SYSTEM" in
-        systemd) systemctl enable nftables 2>/dev/null || true ;;
-        openrc)  rc-update add nftables boot 2>/dev/null || true ;;
+        systemd) systemctl enable nftables || die "Could not enable nftables persistence." ;;
+        openrc)  rc-update add nftables boot || die "Could not enable nftables persistence." ;;
         *)       return 0 ;;
     esac
     ok "nftables enabled at boot."
@@ -847,47 +866,11 @@ enable_nftables() {
 # Post-installation check
 # =============================================================================
 post_install_check() {
-    info "Checking the installation..."
-    local issues=0
-
-    command -v fwsec &>/dev/null          && ok "  fwsec: OK" || { err "  fwsec: NOT FOUND"; ((issues++)); }
-    [[ -f "${CONFIG_DIR}/fwsec.conf" ]]   && ok "  fwsec.conf: OK" || { err "  fwsec.conf: NOT FOUND"; ((issues++)); }
-    command -v nft &>/dev/null            && ok "  nft: OK" || { warn "  nft: not found"; }
-    command -v crowdsec &>/dev/null       && ok "  crowdsec: OK" || { warn "  crowdsec: not found"; }
-    command -v cscli &>/dev/null          && ok "  cscli: OK" || { warn "  cscli: not found"; }
-
-    case "$INIT_SYSTEM" in
-        systemd)
-            if systemctl is-enabled fwsec &>/dev/null; then
-                ok "  fwsec.service: enabled"
-            else
-                warn "  fwsec.service: not enabled"
-            fi
-            ;;
-        openrc)
-            if rc-update show default 2>/dev/null | grep -q fwsec; then
-                ok "  fwsec (OpenRC): added to the default runlevel"
-            else
-                warn "  fwsec (OpenRC): not in the default runlevel"
-            fi
-            ;;
-        *)
-            warn "  boot service: not installed (no systemd/OpenRC)"
-            ;;
-    esac
-
-    if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet firewalld 2>/dev/null; then
-        err "  firewalld: STILL ACTIVE (conflicts with fwsec)"; ((issues++))
+    if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
+        run_diagnostic pending
     else
-        ok "  firewalld: inactive"
+        run_diagnostic runtime
     fi
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
-        err "  ufw: STILL ACTIVE (conflicts with fwsec)"; ((issues++))
-    else
-        ok "  ufw: inactive"
-    fi
-
-    return $issues
 }
 
 # =============================================================================
@@ -945,6 +928,10 @@ bootstrap_source() {
     local ver src_dir
     ver=$(fetch_remote_version)
     src_dir=$(download_source "${ver:-main}") || die "Could not download the fwsec source from ${REPO}."
+    if [[ ! -f "${src_dir}/src/fwsec/installer.py" ]]; then
+        info "Published release predates this installer contract; using current main source."
+        src_dir=$(download_source main) || die "Could not download compatible source; use a current source checkout."
+    fi
     SCRIPT_DIR="$src_dir"
     FWSEC_VERSION=$(grep -E '^version[[:space:]]*=' "${SCRIPT_DIR}/pyproject.toml" \
                     | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -969,8 +956,9 @@ run_upgrade() {
     info "Repository version: ${remote}"
 
     if ! version_gt "$remote" "$installed"; then
-        ok "fwsec ${installed} is already up to date. Nothing to do."
-        exit 0
+        info "Version is current; verifying instead of assuming it is healthy."
+        run_diagnostic runtime
+        exit $?
     fi
 
     echo ""
@@ -988,8 +976,10 @@ run_upgrade() {
     candidate=$(mktemp -d "${INSTALL_DIR}/releases/${remote}.XXXXXX")
     chmod 755 "$candidate"
     runtime="${candidate}/venv"
-    uv venv "$runtime" --python "${PYTHON:-3.11}" --quiet
-    uv pip install --quiet "$SCRIPT_DIR" --python "${runtime}/bin/python"
+    CANDIDATE="$candidate"
+    FWSEC_RUNTIME="$runtime"
+    uv venv "$runtime" --python "${PYTHON:-3.11}" --quiet || die "Upgrade candidate runtime creation failed."
+    uv pip install --quiet "$SCRIPT_DIR" --python "${runtime}/bin/python" || die "Upgrade candidate build failed."
     [[ "$("${runtime}/bin/python" -c 'from fwsec import __version__; print(__version__)')" == "$remote" ]] || \
         die "Candidate version does not match the release; installed code is unchanged."
 
@@ -1010,10 +1000,11 @@ run_upgrade() {
         die "Upgrade confirmation failed; upgrade NOT completed."
     fi
     rm -rf "$(dirname "$src_dir")"
-    ok "fwsec upgraded to ${remote}. Configuration files were preserved."
-    fwsec -v
-    echo ""
-    exit 0
+    local verified=0
+    run_diagnostic runtime || verified=$?
+    [[ "$verified" -eq 0 || "$verified" -eq 4 ]] || return "$verified"
+    INSTALL_ACCEPTED=1
+    exit "$verified"
 }
 
 # =============================================================================
@@ -1468,127 +1459,194 @@ configure_ports_if_needed() {
 # =============================================================================
 # Main
 # =============================================================================
-main() {
-    # Parse flags
-    FORCE=0
-    UPGRADE=0
-    INSTALL_ONLY=0
-    NO_CROWDSEC=0
-    CONF_IS_NEW=0
-    MIGRATION_APPROVE=""
+parse_options() {
+    FORCE=0; UPGRADE=0; INSTALL_ONLY=0; NO_CROWDSEC=1; CONF_IS_NEW=0
+    PREFLIGHT_ONLY=0; VERIFY_ONLY=0; REPORT_JSON=0; ALLOW_UNTESTED=0
+    REQUIRE_CROWDSEC=0; ADOPT_VENDOR_LOADER=0; REQUESTED_PYTHON=""; MIGRATION_APPROVE=""
+    local arg
     for arg in "$@"; do
         case "$arg" in
-            --force)       FORCE=1 ;;
-            --upgrade)     UPGRADE=1 ;;
-            --no-crowdsec) NO_CROWDSEC=1 ;;
+            --help|-h) printf '%s\n' 'Usage: bash install.sh [--preflight|--verify-only|--install-only|--upgrade|--force] [OPTIONS]' \
+                'Read-only: --preflight, --verify-only; add --json for a structured report.' \
+                'Options: --python=/absolute/path --allow-untested --with-crowdsec --no-crowdsec' \
+                '         --require-crowdsec --adopt-vendor-loader --migration-approve=FINGERPRINT'; exit 0 ;;
+            --force) FORCE=1 ;;
+            --upgrade) UPGRADE=1 ;;
             --install-only) INSTALL_ONLY=1 ;;
+            --preflight) PREFLIGHT_ONLY=1 ;;
+            --verify-only) VERIFY_ONLY=1 ;;
+            --json) REPORT_JSON=1 ;;
+            --allow-untested) ALLOW_UNTESTED=1 ;;
+            --no-crowdsec) NO_CROWDSEC=1 ;;
+            --with-crowdsec) NO_CROWDSEC=0 ;;
+            --require-crowdsec) REQUIRE_CROWDSEC=1 ;;
+            --adopt-vendor-loader) ADOPT_VENDOR_LOADER=1 ;;
+            --python=*) REQUESTED_PYTHON="${arg#*=}" ;;
             --migration-approve=*) MIGRATION_APPROVE="${arg#*=}" ;;
+            *) err "Unknown option: $arg (use --help)"; exit 2 ;;
         esac
     done
-
-    # Standalone execution (curl | bash): fetch the source tree first
-    bootstrap_source
-
-    echo ""
-    echo -e "${BOLD}${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}  fwsec ${FWSEC_VERSION} — Installer${NC}"
-    echo -e "${BOLD}${CYAN}  nftables + CrowdSec firewall manager${NC}"
-    echo -e "${BOLD}${CYAN}============================================${NC}"
-    echo ""
-
-    # Skip if already installed unless --force or --upgrade is set
-    if [[ "$FORCE" -eq 0 && "$UPGRADE" -eq 0 ]]; then
-        check_already_installed
-    elif [[ "$FORCE" -eq 1 ]]; then
-        warn "--force mode: reinstalling over the existing installation."
-    elif [[ "$UPGRADE" -eq 1 ]]; then
-        info "--upgrade mode: checking the repository for a newer version..."
+    [[ $((FORCE + UPGRADE + PREFLIGHT_ONLY + VERIFY_ONLY)) -le 1 ]] || { err "Conflicting installer modes."; exit 2; }
+    if [[ "$PREFLIGHT_ONLY" -eq 1 || "$VERIFY_ONLY" -eq 1 ]]; then
+        [[ "$ADOPT_VENDOR_LOADER" -eq 0 && -z "$MIGRATION_APPROVE" ]] || { err "Read-only modes cannot adopt loaders/policies."; exit 2; }
     fi
+    [[ "$UPGRADE" -eq 0 || "$INSTALL_ONLY" -eq 0 ]] || { err "--upgrade conflicts with --install-only."; exit 2; }
+    [[ "$PREFLIGHT_ONLY" -eq 0 || "$INSTALL_ONLY" -eq 0 ]] || { err "--preflight already selects capability checks."; exit 2; }
+}
 
+doctor() {
+    local python="${FWSEC_RUNTIME:+${FWSEC_RUNTIME}/bin/python}"
+    local -a args=("$@")
+    [[ "${ALLOW_UNTESTED:-0}" -eq 0 ]] || args+=(--allow-untested)
+    if [[ -z "$python" ]]; then
+        find_python || die "Read-only diagnostics need an existing Python 3.8+/SSL; no packages were installed."
+        python="$PYTHON"
+    fi
+    if [[ -f "${SCRIPT_DIR}/src/fwsec/installer.py" ]]; then
+        "$python" -I -B "${SCRIPT_DIR}/src/fwsec/installer.py" "${args[@]}"
+    else
+        "$python" -I -B -m fwsec.installer "${args[@]}"
+    fi
+}
+
+run_diagnostic() {
+    local mode="$1"
+    local -a args=(--mode "$mode")
+    [[ "$REPORT_JSON" -eq 0 ]] || args+=(--json)
+    [[ "$REQUIRE_CROWDSEC" -eq 0 ]] || args+=(--require-crowdsec)
+    [[ "${MIGRATION_STAGED:-0}" -eq 0 ]] || args+=(--migration)
+    if [[ "$mode" == runtime && "${INIT_SYSTEM:-none}" != none && "$VERIFY_ONLY" -eq 0 ]]; then
+        args+=(--require-boot)
+    fi
+    if [[ -n "${FWSEC_RUNTIME:-}" && "$mode" != preflight ]]; then args+=(--expected "$FWSEC_VERSION"); fi
+    local output result=0
+    output=$(doctor "${args[@]}") || result=$?
+    if [[ "$REPORT_JSON" -eq 1 && "$output" != \{* ]]; then
+        err "Structured diagnostic could not run; no success was certified."
+        return 1
+    fi
+    printf '%s\n' "$output" >&3
+    REPORT_EMITTED=1
+    return "$result"
+}
+
+installer_exit() {
+    local rc="$1"
+    trap - EXIT
+    set +e
+    if [[ "$rc" -ne 0 && "${INSTALL_ACCEPTED:-0}" -eq 0 && -n "${RECOVERY_DIR:-}" ]]; then
+        local recover=1
+        if [[ -n "${INSTALL_TRANSACTION:-}" ]]; then
+            if [[ -f "/var/lib/fwsec/transactions/${INSTALL_TRANSACTION}/confirmed" ]]; then
+                recover=0
+                err "Activation was confirmed, but final diagnostics failed. State retained for review; no blind rollback."
+            elif [[ -f "/var/lib/fwsec/transactions/${INSTALL_TRANSACTION}/pending" ]]; then
+                "${FWSEC_RUNTIME}/bin/fwsec" --rollback "$INSTALL_TRANSACTION" || recover=0
+            fi
+        fi
+        if [[ "$recover" -eq 1 ]]; then
+            doctor --restore "$RECOVERY_DIR" || err "File/boot restoration failed; inspect $RECOVERY_DIR immediately."
+        fi
+    fi
+    if [[ "${REPORT_JSON:-0}" -eq 1 && "${REPORT_EMITTED:-0}" -eq 0 ]]; then
+        printf '{"schema":1,"state":"FAILED","exit_code":%s,"data":{"errors":["Installation stopped; inspect stderr/private log. No full success was certified."]}}\n' "$rc" >&3
+    fi
+    [[ "$rc" -eq 0 || "$rc" -eq 3 || "$rc" -eq 4 ]] || err "Installation NOT certified. Private log: ${INSTALL_LOG:-not created}"
+    exit "$rc"
+}
+
+main() {
+    parse_options "$@"
+    exec 3>&1
+    [[ "$REPORT_JSON" -eq 0 ]] || exec 1>&2
+    REPORT_EMITTED=0; INSTALL_ACCEPTED=0
+    trap 'installer_exit $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo bash install.sh"
     detect_os
     detect_init
-    ok "Init system: ${INIT_SYSTEM}."
+    if [[ "$PREFLIGHT_ONLY" -eq 1 || "$VERIFY_ONLY" -eq 1 ]]; then
+        local mode=preflight
+        if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+            mode=runtime
+            [[ "$INSTALL_ONLY" -eq 0 ]] || mode=code
+        fi
+        run_diagnostic "$mode"
+        return $?
+    fi
+    if [[ -d /var/lib/fwsec/transactions ]] && \
+       [[ -n "$(find /var/lib/fwsec/transactions -mindepth 2 -maxdepth 2 -name pending -print -quit)" ]]; then
+        die "A safe apply is pending: confirm or roll it back before installation."
+    fi
+    if [[ "$FORCE" -eq 0 && "$UPGRADE" -eq 0 ]]; then check_already_installed; fi
+    INSTALL_LOG=$(mktemp "${TMPDIR:-/var/tmp}/fwsec-install.log.XXXXXX")
+    chmod 600 "$INSTALL_LOG"
+    bootstrap_deps
+    bootstrap_source
     detect_migration_source
-
-    # Upgrade: consult the repository and install a newer release when available.
-    # Only the package and executable change; configuration is preserved.
     if [[ "$UPGRADE" -eq 1 ]]; then
         run_upgrade
     fi
-
-    # Explicit code-only mode for image building / unprivileged CI containers.
-    # No source-firewall migration, service changes, config writes or rule apply.
-    if [[ "$INSTALL_ONLY" -eq 1 ]]; then
-        install_base_deps
-        install_python
-        install_uv
-        install_fwsec_package
-        install_binary
-        ok "Code installed only; firewall policy/services/configuration unchanged."
-        return 0
-    fi
-
     install_base_deps
     install_python
     install_uv
-    configure_selinux
-    configure_apparmor
+    install_fwsec_package
+    RECOVERY_DIR=$(mktemp -d "${INSTALL_DIR}/installer-backup.XXXXXX")
+    chmod 700 "$RECOVERY_DIR"
+    doctor --snapshot "$RECOVERY_DIR"
+    if [[ "$INSTALL_ONLY" -eq 1 ]]; then
+        install_binary
+        local result=0
+        run_diagnostic code || result=$?
+        [[ "$result" -eq 0 || "$result" -eq 4 ]] || return "$result"
+        INSTALL_ACCEPTED=1
+        return "$result"
+    fi
+    # Fail before any config/service writes if capabilities are unavailable.
+    doctor --mode preflight || die "Firewall prerequisites are not satisfied; existing policy unchanged."
     run_migration_stage
     disable_competing_firewalls
-    install_crowdsec
-    enable_nftables
-    install_fwsec_package
     install_config_files
     configure_ports_if_needed
     [[ "$MIGRATION_STAGED" -eq 1 ]] || configure_containers
-    configure_crowdsec_container_logs
-    install_binary
-    install_service
-
-    echo ""
-    info "Starting fwsec for the first time..."
-    local -a start_cmd=(fwsec -s)
-    if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
-        start_cmd=(fwsec --apply-safe --timeout 120)
+    [[ "$ADOPT_VENDOR_LOADER" -eq 0 ]] || doctor --adopt-vendor-loader
+    # No SELinux/AppArmor or CrowdSec configuration changes without explicit scope.
+    if [[ "$NO_CROWDSEC" -eq 0 ]]; then install_crowdsec; fi
+    local enabled
+    enabled=$("${FWSEC_RUNTIME}/bin/python" -I -c 'from fwsec.config import load_config; print(int(load_config().enabled))')
+    if [[ "$enabled" -eq 0 ]]; then
+        install_binary
+        warn "Existing configuration intentionally disables filtering; only code will be certified."
+        local disabled_result=0
+        run_diagnostic code || disabled_result=$?
+        [[ "$disabled_result" -eq 0 || "$disabled_result" -eq 4 ]] || return "$disabled_result"
+        INSTALL_ACCEPTED=1
+        return "$disabled_result"
     fi
-    if "${start_cmd[@]}"; then
-        ok "fwsec started successfully."
+    install_service
+    enable_nftables
+    "${FWSEC_RUNTIME}/bin/fwsec" --install-apply --upgrade-state "${CANDIDATE}/transaction-id" \
+        --install-backup "$RECOVERY_DIR"
+    INSTALL_TRANSACTION=$(cat "${CANDIDATE}/transaction-id")
+    if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
+        "${FWSEC_RUNTIME}/bin/fwsec" --install-activate "$INSTALL_TRANSACTION"
         remove_migrated_firewall
     else
-        warn "fwsec failed to start. Run it manually: fwsec -s"
-        if [[ "$MIGRATION_STAGED" -eq 1 ]]; then
-            warn "The previous firewall was NOT removed (fwsec is not filtering)."
-        fi
-        die "Firewall application failed; installation is NOT complete."
+        "${FWSEC_RUNTIME}/bin/fwsec" --install-activate "$INSTALL_TRANSACTION"
+        local provisional=0
+        local -a provisional_args=(--mode pending --expected "$FWSEC_VERSION")
+        [[ "$REQUIRE_CROWDSEC" -eq 0 ]] || provisional_args+=(--require-crowdsec)
+        doctor "${provisional_args[@]}" || provisional=$?
+        [[ "$provisional" -eq 3 ]] || die "Provisional verification failed; rollback remains armed."
+        "${FWSEC_RUNTIME}/bin/fwsec" --confirm "$INSTALL_TRANSACTION"
     fi
-
-    echo ""
-    info "Running the post-installation check..."
-    post_install_check || true
+    local final_result=0
+    post_install_check || final_result=$?
+    [[ "$final_result" -eq 0 || "$final_result" -eq 3 || "$final_result" -eq 4 ]] || return "$final_result"
+    INSTALL_ACCEPTED=1
     migration_report
-
-    local ssh_ports
-    ssh_ports=$(_detect_ssh_ports_bash | tr '\n' ',' | sed -E 's/,$//' || true)
-
-    echo ""
-    echo -e "${BOLD}${GREEN}============================================${NC}"
-    echo -e "${BOLD}${GREEN}  fwsec installed successfully!${NC}"
-    echo -e "${BOLD}${GREEN}============================================${NC}"
-    echo -e "  Config dir  : ${CONFIG_DIR}/"
-    echo -e "  Executable  : ${BIN}"
-    echo -e "  SSH port(s) : ${ssh_ports:-22}"
-    echo ""
-    echo -e "  ${BOLD}Useful commands:${NC}"
-    echo -e "    fwsec -s              Start the firewall"
-    echo -e "    fwsec -r              Reload rules"
-    echo -e "    fwsec -l              List rules"
-    echo -e "    fwsec -c              Validate the configuration"
-    echo -e "    fwsec -d IP [reason]  Block an IP address"
-    echo -e "    fwsec -a IP [reason]  Allow an IP address"
-    echo -e "    fwsec -g IP           Search for an IP address"
-    echo -e "    fwsec -h              Show full help"
-    echo -e "${BOLD}${GREEN}============================================${NC}"
-    echo ""
+    return "$final_result"
 }
 
-main "$@"
+if [[ "${FWSEC_INSTALLER_LIBRARY:-0}" != 1 ]]; then main "$@"; fi

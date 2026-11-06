@@ -22,15 +22,21 @@ class TransactionTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         for name, path in (("ROOT", "transactions"), ("LOCK", "lock"),
-                           ("LOADER_DEBIAN", "nftables.conf"),
-                           ("LOADER_RHEL", "sysconfig"), ("INCLUDE", "fwsec.nft")):
+                            ("LOADER_DEBIAN", "nftables.conf"),
+                            ("LOADER_RHEL", "sysconfig"), ("INCLUDE", "fwsec.nft")):
             p = patch.object(transaction, name, self.root / path)
             p.start()
             self.addCleanup(p.stop)
+        alpine = patch.object(transaction, "LOADER_ALPINE", self.root / "alpine.nft")
+        alpine.start()
+        self.addCleanup(alpine.stop)
         self.before = {"fwsec": "", "filter_exists": False, "chains": {}, "sets": []}
         receipt = patch.object(transaction, "record_applied")
         receipt.start()
         self.addCleanup(receipt.stop)
+        wrapper = patch.object(transaction, "verify_activation_wrapper")
+        wrapper.start()
+        self.addCleanup(wrapper.stop)
 
     def test_invalid_ports_rejected(self):
         for ports in (["0"], ["65536"], ["100:20"], ["22; flush ruleset"], ["1:2:3"]):
@@ -314,6 +320,22 @@ class TransactionTests(unittest.TestCase):
             with transaction.locked():
                 with self.assertRaisesRegex(RuntimeError, "persist failed"):
                     transaction.activate_upgrade(ident)
+        self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
+        self.assertTrue((directory / "rolled-back").exists())
+
+    def test_wrapper_verification_failure_rolls_back_before_confirmation(self):
+        config.EXECUTABLE.write_text("old wrapper")
+        self.before["files"] = transaction.snapshot_files()
+        ident, directory = self.trial()
+        with patch.object(transaction, "verify_activation_wrapper",
+                          side_effect=ValueError("invalid candidate")), \
+                patch.object(transaction, "confirm") as confirm, \
+                patch.object(transaction, "restore_script", return_value="restore"), \
+                patch.object(transaction, "check"), patch("fwsec.nft._run_script"):
+            with transaction.locked():
+                with self.assertRaisesRegex(ValueError, "invalid candidate"):
+                    transaction.activate_upgrade(ident)
+        confirm.assert_not_called()
         self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
         self.assertTrue((directory / "rolled-back").exists())
 

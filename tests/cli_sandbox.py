@@ -38,7 +38,7 @@ def run() -> None:
                      "EXECUTABLE", "MIGRATION_RECEIPT", "APPLIED_FILE"):
             setattr(config, name, root / name)
         state.STATE_FILE = config.STATE_FILE
-        for name in ("LOADER_DEBIAN", "LOADER_RHEL", "INCLUDE", "ROOT", "LOCK"):
+        for name in ("LOADER_DEBIAN", "LOADER_RHEL", "LOADER_ALPINE", "INCLUDE", "ROOT", "LOCK"):
             setattr(transaction, name, root / name)
         config.CONF_FILE.write_text("[firewall]\nENABLED=1\nTCP_IN=22\n"
                                     "[crowdsec]\nENABLED=0\n")
