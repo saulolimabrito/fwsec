@@ -122,6 +122,38 @@ ensure_command command_that_does_not_exist required-package
         with self.assertRaises(ValueError):
             installer.verify_wrapper(wrapper)
 
+    def test_path_alias_allowed_but_shadowing_rejected(self):
+        canonical = self.root / "fwsec"
+        canonical.write_text("wrapper")
+        alias = self.root / "alias"
+        alias.symlink_to(canonical)
+        shadow = self.root / "shadow"
+        shadow.write_text("wrapper")
+        self.assertTrue(installer.same_file(str(alias), canonical))
+        self.assertFalse(installer.same_file(str(shadow), canonical))
+        self.assertFalse(installer.same_file(None, canonical))
+
+    def test_lazy_hashed_ca_store(self):
+        hashed = self.root / "abcdef12.0"
+        hashed.write_text("certificate")
+        context = Mock()
+        context.cert_store_stats.side_effect = [{"x509_ca": 0}, {"x509_ca": 1}]
+        with patch.object(installer.ssl, "create_default_context", return_value=context), \
+                patch.object(installer.ssl, "get_default_verify_paths",
+                             return_value=Mock(capath=str(self.root))):
+            self.assertTrue(installer.ca_trust_available())
+        context.load_verify_locations.assert_called_once_with(cafile=str(hashed))
+
+    def test_invalid_hashed_ca_not_accepted(self):
+        (self.root / "abcdef12.0").write_text("invalid certificate")
+        context = Mock()
+        context.cert_store_stats.return_value = {"x509_ca": 0}
+        context.load_verify_locations.side_effect = installer.ssl.SSLError("invalid")
+        with patch.object(installer.ssl, "create_default_context", return_value=context), \
+                patch.object(installer.ssl, "get_default_verify_paths",
+                             return_value=Mock(capath=str(self.root))):
+            self.assertFalse(installer.ca_trust_available())
+
     def test_snapshot_restore_preserves_mode_and_absence(self):
         backup = self.root / "backup"
         backup.mkdir(mode=0o700)

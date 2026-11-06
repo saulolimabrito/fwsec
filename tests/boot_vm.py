@@ -56,8 +56,8 @@ def test_vm(kind: str, work: Path) -> None:
     userdata = work / "user-data"
     userdata.write_text("#cloud-config\ndisable_root: false\nssh_pwauth: false\n"
                         "users:\n  - name: root\n    ssh_authorized_keys:\n      - " + pub +
-                        "\nchpasswd:\n  expire: false\n  list: |\n    root:"
-                        + secrets.token_hex(24) +
+                        "\nchpasswd:\n  expire: false\n  users:\n    - name: root\n"
+                        "      password: " + secrets.token_hex(24) + "\n      type: text" +
                         "\npackage_update: true\npackages:\n  - bash\n  - curl\n"
                         "  - ca-certificates\n  - python3\n")
     userdata.chmod(0o600)
@@ -72,9 +72,10 @@ def test_vm(kind: str, work: Path) -> None:
            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
            "-o", "ConnectTimeout=5", "root@127.0.0.1"]
 
-    def remote(command: str, data: bytes | None = None, timeout: int = 600):
+    def remote(command: str, data: bytes | None = None, timeout: int = 600,
+               accepted: tuple[int, ...] = (0, 4)):
         result = subprocess.run(ssh + [command], input=data, capture_output=True, timeout=timeout)
-        if result.returncode not in (0, 4):
+        if result.returncode not in accepted:
             raise RuntimeError(command + "\n" + result.stdout.decode(errors="replace")[-6000:]
                                + result.stderr.decode(errors="replace")[-6000:])
         return result.stdout.decode()
@@ -99,7 +100,9 @@ def test_vm(kind: str, work: Path) -> None:
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         first_boot = wait_boot()
-        remote("cloud-init status --wait")
+        cloud = json.loads(remote("cloud-init status --wait --format json", accepted=(0, 2)))
+        print("cloud-init:", json.dumps(cloud))
+        assert cloud.get("status") == "done" and not cloud.get("errors"), cloud
         archive = checked(["git", "archive", "--format=tar.gz", "HEAD"]).stdout
         remote("mkdir /root/fwsec-source; tar -xz -C /root/fwsec-source", archive)
         # An unknown option must fail before any installation, even on a clean VM.
@@ -126,8 +129,9 @@ def test_vm(kind: str, work: Path) -> None:
         wait_boot(first_boot)
         for attempt in range(30):
             report = json.loads(remote("cd /root/fwsec-source; "
-                                       "bash install.sh --verify-only --json"))
-            if report["data"]["checks"].get("runtime", {}).get("static_rules") == "verified":
+                                       "bash install.sh --verify-only --json", accepted=(0, 1, 4)))
+            if (report["state"] in ("OPERATIONAL", "READY_WITH_WARNINGS") and
+                    report["data"]["checks"].get("runtime", {}).get("static_rules") == "verified"):
                 break
             time.sleep(2)
         else:

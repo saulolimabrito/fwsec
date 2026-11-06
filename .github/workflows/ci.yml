@@ -80,7 +80,7 @@ jobs:
               rocky) dnf install --allowerasing -y -q curl ca-certificates iptables iproute ;;
             esac
             bash install.sh --install-only
-            runtime=$(sed -n 's|^exec "\([^"]*\)".*|\1|p' /usr/local/bin/fwsec)
+            runtime=$(awk "NR==2 {gsub(/\"/, \"\", \$2); print \$2}" /usr/local/bin/fwsec)
             export PYTHONPATH=/src/src
             nft --version
             for test in nft_sandbox.py upgrade_sandbox.py cli_sandbox.py; do

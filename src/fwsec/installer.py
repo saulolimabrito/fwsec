@@ -92,6 +92,25 @@ def support_errors(env: dict[str, Any], allow_untested: bool) -> list[str]:
     return errors
 
 
+def ca_trust_available() -> bool:
+    context = ssl.create_default_context()
+    if context.cert_store_stats().get("x509_ca"):
+        return True
+    # OpenSSL lazily reads hashed capath stores. A zero initial count is NOT
+    # proof that CA trust is absent (e.g. /usr/lib/ssl/certs on Ubuntu/Zimbra).
+    paths = ssl.get_default_verify_paths()
+    if paths.capath and Path(paths.capath).is_dir():
+        for path in Path(paths.capath).iterdir():
+            if re.fullmatch(r"[0-9a-fA-F]{8}\.\d+", path.name) and path.is_file():
+                try:
+                    context.load_verify_locations(cafile=str(path))
+                    if context.cert_store_stats().get("x509_ca"):
+                        return True
+                except (OSError, ssl.SSLError):
+                    continue
+    return False
+
+
 def verify_wrapper(binary: Path, expected: str | None = None) -> dict[str, Any]:
     if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValueError(f"Canonical wrapper missing, symlinked or not executable: {binary}")
@@ -148,8 +167,8 @@ def probe(mode: str, binary: Path = BIN, expected: str | None = None,
     try:
         ssl.create_default_context()
         checks["python_ssl"] = True
-        checks["ca_certificates"] = bool(
-            ssl.create_default_context().cert_store_stats().get("x509_ca"))
+        checks["ca_certificates"] = ca_trust_available()
+        checks["external_https_handshake"] = "not tested (SSL and local trust configuration only)"
         if not checks["ca_certificates"]:
             errors.append("No trusted CA certificates; HTTPS downloads cannot be certified")
     except (ImportError, OSError) as exc:
@@ -194,7 +213,7 @@ def probe(mode: str, binary: Path = BIN, expected: str | None = None,
             resolved = shutil.which("fwsec")
             clean = shutil.which("fwsec", path=PATH)
             checks["path"] = {"current": resolved, "clean": clean, "canonical": str(binary)}
-            if resolved != str(binary) or clean != str(binary):
+            if not all(same_file(path, binary) for path in (resolved, clean)):
                 errors.append("PATH does not select the canonical wrapper. Review PATH/shadowing; "
                               "no shell profiles were changed")
     if mode in ("runtime", "pending") and "wrapper" in checks:
@@ -237,6 +256,13 @@ def probe(mode: str, binary: Path = BIN, expected: str | None = None,
              "PREFLIGHT_PASSED" if mode == "preflight" else "OPERATIONAL")
     code = 1 if errors else 3 if mode == "pending" else 4 if warnings else 0
     return {"schema": SCHEMA, "state": state, "exit_code": code, "data": data}
+
+
+def same_file(path: str | None, canonical: Path) -> bool:
+    try:
+        return path is not None and os.path.samefile(path, canonical)
+    except OSError:
+        return False
 
 
 def snapshot(directory: Path, restore: bool = False, paths: list[Path] | None = None) -> None:
