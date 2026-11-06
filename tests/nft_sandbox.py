@@ -34,6 +34,7 @@ def run() -> None:
         transaction.LOCK = base / "lock"
         transaction.LOADER_DEBIAN = base / "nftables.conf"
         transaction.LOADER_RHEL = base / "sysconfig.conf"
+        transaction.LOADER_ALPINE = base / "alpine.nft"
         transaction.INCLUDE = base / "fwsec.nft"
         config.ALLOW_FILE.write_text("192.0.2.1\n")
         c = config.FwsecConfig(container_mode=True)

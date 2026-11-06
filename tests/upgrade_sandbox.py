@@ -29,6 +29,7 @@ def run() -> None:
         transaction.LOCK = root / "lock"
         transaction.LOADER_DEBIAN = root / "loader"
         transaction.LOADER_RHEL = root / "sysconfig"
+        transaction.LOADER_ALPINE = root / "alpine.nft"
         transaction.INCLUDE = root / "rules.nft"
         config.CONF_FILE.write_text("[firewall]\nWHITELIST_MARK=1\n"
                                     "[containers]\nCONTAINER_MODE=1\n")

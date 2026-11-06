@@ -89,6 +89,7 @@ def run(source: str) -> None:
             transaction.LOCK = root / "lock"
             transaction.LOADER_DEBIAN = root / "loader"
             transaction.LOADER_RHEL = root / "sysconfig"
+            transaction.LOADER_ALPINE = root / "alpine.nft"
             transaction.INCLUDE = root / "rules.nft"
             first = migration.capture(source, root / "plan.json")
             assert first["status"] == "requires-approval"

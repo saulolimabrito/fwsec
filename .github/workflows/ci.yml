@@ -7,17 +7,39 @@ on:
     branches: [main]
 
 jobs:
+  installer-boot:
+    name: Full installation and real reboot — ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, alpine]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install QEMU and cloud-init seed tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+          if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
+      - name: Fresh install, failed candidate recovery, reinstall and reboot
+        run: python3 tests/boot_vm.py "${{ matrix.os }}" --work "$RUNNER_TEMP/fwsec-boot"
+
   nft-integration:
     name: Scoped transactions and detached rollback (real nftables)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install nftables
-        run: sudo apt-get update -qq && sudo apt-get install -y nftables iptables iproute2
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables iptables iproute2 python3-venv
+          python3 -m venv .nft-venv
+          .nft-venv/bin/pip install .
       - name: Run exclusively inside a disposable network namespace
         run: |
           set -o pipefail
-          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/nft_sandbox.py 2>&1 | tee /tmp/nft-test.log || {
+          sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/nft_sandbox.py 2>&1 | tee /tmp/nft-test.log || {
             echo "::error::$(tail -n 20 /tmp/nft-test.log | tr '\n' ' ')"
             exit 1
           }
@@ -25,7 +47,7 @@ jobs:
         run: |
           set -o pipefail
           for source in ufw csf; do
-            sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/migration_sandbox.py --source "$source" 2>&1 | tee /tmp/migration-test.log || {
+            sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/migration_sandbox.py --source "$source" 2>&1 | tee /tmp/migration-test.log || {
               echo "::error::$(tail -n 14 /tmp/migration-test.log | tr '\n' ' ')"
               exit 1
             }
@@ -33,12 +55,12 @@ jobs:
       - name: Verify legacy upgrade and executable rollback
         run: |
           set -o pipefail
-          sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/upgrade_sandbox.py 2>&1 | tee /tmp/upgrade-test.log || {
+          sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/upgrade_sandbox.py 2>&1 | tee /tmp/upgrade-test.log || {
             echo "::error::$(tail -n 25 /tmp/upgrade-test.log | tr '\n' ' ')"
             exit 1
           }
       - name: Exercise user-facing actions and structured queries
-        run: sudo env PYTHONPATH="$PWD/src" unshare --net python3 tests/cli_sandbox.py
+        run: sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/cli_sandbox.py
 
   legacy-nft:
     name: Real legacy nftables — ${{ matrix.container }}
@@ -58,13 +80,14 @@ jobs:
               rocky) dnf install --allowerasing -y -q curl ca-certificates iptables iproute ;;
             esac
             bash install.sh --install-only
+            runtime=$(sed -n 's|^exec "\([^"]*\)".*|\1|p' /usr/local/bin/fwsec)
             export PYTHONPATH=/src/src
             nft --version
             for test in nft_sandbox.py upgrade_sandbox.py cli_sandbox.py; do
-              unshare --net /opt/fwsec/venv/bin/python "tests/$test"
+              unshare --net "$runtime" "tests/$test"
             done
             for source in ufw csf; do
-              unshare --net /opt/fwsec/venv/bin/python tests/migration_sandbox.py --source "$source"
+              unshare --net "$runtime" tests/migration_sandbox.py --source "$source"
             done
           '
 
@@ -136,7 +159,7 @@ jobs:
           esac
       - uses: actions/checkout@v4
       - name: Install code without NET_ADMIN (--install-only)
-        run: bash install.sh --force --install-only
+        run: PATH="/usr/local/bin:$PATH" bash install.sh --force --install-only
       - name: Smoke (fwsec -v / -c)
         run: |
           /usr/local/bin/fwsec -v > /tmp/fwsec-version.log 2>&1 || { cat /tmp/fwsec-version.log; echo "::error::$(tr '\n' ' ' < /tmp/fwsec-version.log)"; exit 1; }

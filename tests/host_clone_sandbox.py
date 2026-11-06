@@ -42,7 +42,7 @@ def run() -> None:
                 shutil.copy2(old, new)
             setattr(config, name, new)
         config.CONFIG_DIR = root
-        for name in ("LOADER_DEBIAN", "LOADER_RHEL", "INCLUDE"):
+        for name in ("LOADER_DEBIAN", "LOADER_RHEL", "LOADER_ALPINE", "INCLUDE"):
             old = getattr(transaction, name)
             new = root / name
             if old.exists():
