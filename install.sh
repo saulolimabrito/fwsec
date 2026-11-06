@@ -3,8 +3,8 @@
 # =============================================================================
 # fwsec installer
 # Supported systems: Debian 12+ | Ubuntu 22.04+ | RHEL-family 8+ (Rocky, Alma,
-# RHEL, CentOS Stream, Oracle, Fedora 40+, Amazon Linux 2023) | openSUSE Leap
-# 15.4+ / SLES 15+ | Arch | Alpine 3.17+ (OpenRC)
+# RHEL, CentOS Stream, Oracle, Fedora 43+, Amazon Linux 2023) | openSUSE Leap
+# 16+ / SLES 15.7+ | Arch | Alpine 3.22+ (OpenRC)
 # =============================================================================
 set -euo pipefail
 
@@ -710,16 +710,16 @@ install_fwsec_package() {
     chmod 755 "$CANDIDATE"
     FWSEC_RUNTIME="${CANDIDATE}/venv"
     if [[ -n "$PYTHON" ]]; then
-        uv venv "$FWSEC_RUNTIME" --python "$PYTHON" --quiet
+        uv venv "$FWSEC_RUNTIME" --python "$PYTHON" --quiet || die "Candidate runtime creation failed; previous runtime preserved."
     else
         # uv downloads a standalone CPython (glibc or musl) when no system
         # Python satisfies the floor — works on any distribution.
-        uv venv "$FWSEC_RUNTIME" --python 3.11 --quiet
+        uv venv "$FWSEC_RUNTIME" --python 3.11 --quiet || die "Managed candidate runtime creation failed."
     fi
 
     info "Installing fwsec ${FWSEC_VERSION}..."
     uv pip install --quiet "${SCRIPT_DIR}" \
-        --python "${FWSEC_RUNTIME}/bin/python"
+        --python "${FWSEC_RUNTIME}/bin/python" || die "Candidate build failed; previous runtime and wrapper preserved."
     "${FWSEC_RUNTIME}/bin/python" -I -c 'import ssl,fcntl,fwsec; ssl.create_default_context()'
     [[ "$("${FWSEC_RUNTIME}/bin/fwsec" --version)" == "fwsec ${FWSEC_VERSION}" ]] || die "Candidate version mismatch; previous runtime is unchanged."
 
@@ -975,8 +975,8 @@ run_upgrade() {
     runtime="${candidate}/venv"
     CANDIDATE="$candidate"
     FWSEC_RUNTIME="$runtime"
-    uv venv "$runtime" --python "${PYTHON:-3.11}" --quiet
-    uv pip install --quiet "$SCRIPT_DIR" --python "${runtime}/bin/python"
+    uv venv "$runtime" --python "${PYTHON:-3.11}" --quiet || die "Upgrade candidate runtime creation failed."
+    uv pip install --quiet "$SCRIPT_DIR" --python "${runtime}/bin/python" || die "Upgrade candidate build failed."
     [[ "$("${runtime}/bin/python" -c 'from fwsec import __version__; print(__version__)')" == "$remote" ]] || \
         die "Candidate version does not match the release; installed code is unchanged."
 
@@ -1630,7 +1630,13 @@ main() {
         "${FWSEC_RUNTIME}/bin/fwsec" --install-activate "$INSTALL_TRANSACTION"
         remove_migrated_firewall
     else
-        "${FWSEC_RUNTIME}/bin/fwsec" --upgrade-activate "$INSTALL_TRANSACTION"
+        "${FWSEC_RUNTIME}/bin/fwsec" --install-activate "$INSTALL_TRANSACTION"
+        local provisional=0
+        local -a provisional_args=(--mode pending --expected "$FWSEC_VERSION")
+        [[ "$REQUIRE_CROWDSEC" -eq 0 ]] || provisional_args+=(--require-crowdsec)
+        doctor "${provisional_args[@]}" || provisional=$?
+        [[ "$provisional" -eq 3 ]] || die "Provisional verification failed; rollback remains armed."
+        "${FWSEC_RUNTIME}/bin/fwsec" --confirm "$INSTALL_TRANSACTION"
     fi
     local final_result=0
     post_install_check || final_result=$?

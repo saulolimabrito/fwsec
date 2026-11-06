@@ -323,6 +323,22 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
         self.assertTrue((directory / "rolled-back").exists())
 
+    def test_wrapper_verification_failure_rolls_back_before_confirmation(self):
+        config.EXECUTABLE.write_text("old wrapper")
+        self.before["files"] = transaction.snapshot_files()
+        ident, directory = self.trial()
+        with patch.object(transaction, "verify_activation_wrapper",
+                          side_effect=ValueError("invalid candidate")), \
+                patch.object(transaction, "confirm") as confirm, \
+                patch.object(transaction, "restore_script", return_value="restore"), \
+                patch.object(transaction, "check"), patch("fwsec.nft._run_script"):
+            with transaction.locked():
+                with self.assertRaisesRegex(ValueError, "invalid candidate"):
+                    transaction.activate_upgrade(ident)
+        confirm.assert_not_called()
+        self.assertEqual(config.EXECUTABLE.read_text(), "old wrapper")
+        self.assertTrue((directory / "rolled-back").exists())
+
     def test_no_watchdog_means_no_apply(self):
         with patch.object(transaction, "check"), patch("subprocess.Popen", return_value=Mock()), \
                 patch("time.sleep"), patch("fwsec.nft._run_script") as apply:

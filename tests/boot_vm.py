@@ -119,7 +119,8 @@ def test_vm(kind: str, work: Path) -> None:
         remote("cp -a /root/fwsec-source /root/fwsec-broken; "
                "printf '[' >> /root/fwsec-broken/pyproject.toml; "
                "cd /root/fwsec-broken; bash install.sh --force --install-only --json "
-               ">/root/failure.json 2>/root/failure.log; rc=$?; test $rc -eq 1")
+               ">/root/failure.json 2>/root/failure.log; rc=$?; "
+               "if test $rc -ne 1; then cat /root/failure.json /root/failure.log; exit 1; fi")
         assert remote("sha256sum /usr/local/bin/fwsec").split()[0] == wrapper
         failure = json.loads(remote("cat /root/failure.json"))
         assert failure["state"] == "FAILED", failure
