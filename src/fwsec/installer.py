@@ -271,12 +271,12 @@ def snapshot(directory: Path, restore: bool = False, paths: list[Path] | None = 
     if restore:
         for name, meta in json.loads(manifest.read_text()).items():
             target = Path(name)
+            if target.is_symlink():
+                raise ValueError("Refuse to restore over symlink: " + name)
             if meta is None:
                 if target.is_file():
                     target.unlink()
                 continue
-            if target.is_symlink():
-                raise ValueError("Refuse to restore over symlink: " + name)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(directory / meta, target)
         boot_file = directory / "boot.json"

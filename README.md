@@ -27,7 +27,9 @@ Notes:
 
 ## Quick install
 
-No git required — the installer downloads the latest fwsec release by itself:
+No git required — the installer downloads fwsec source by itself. It prefers the
+latest release; if that release predates the verification installer contract, it
+explicitly falls back to current `main` source (unreleased development code):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/saulolimabrito/fwsec/main/install.sh | sudo bash

@@ -67,6 +67,35 @@ ensure_command command_that_does_not_exist required-package
         self.assertIn('[[ -d /run/systemd/system ]]', text)
         self.assertIn('[[ -d /run/openrc ]]', text)
 
+    def test_existing_configuration_permissions_preserved(self):
+        result = self.shell('''
+CONFIG_DIR="$TEST_DIR/config"; SCRIPT_DIR="$TEST_DIR/source"; CONF_IS_NEW=0
+mkdir -m 700 "$CONFIG_DIR"
+echo "administrator configuration" > "$CONFIG_DIR/fwsec.conf"
+chmod 600 "$CONFIG_DIR/fwsec.conf"
+install_config_files
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "config").stat().st_mode & 0o777, 0o700)
+        conf = self.root / "config/fwsec.conf"
+        self.assertEqual(conf.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(conf.read_text(), "administrator configuration\n")
+
+    def test_bootstrap_uses_source_with_current_installer_contract(self):
+        result = self.shell('''
+SCRIPT_DIR="$TEST_DIR/standalone"
+mkdir -p "$TEST_DIR/old" "$TEST_DIR/current/src/fwsec"
+touch "$TEST_DIR/current/src/fwsec/installer.py"
+echo 'version = "1.6.1"' > "$TEST_DIR/current/pyproject.toml"
+fetch_remote_version() { echo 1.6.1; }
+download_source() {
+    if [[ "$1" == main ]]; then echo "$TEST_DIR/current"; else echo "$TEST_DIR/old"; fi
+}
+bootstrap_source
+[[ "$SCRIPT_DIR" == "$TEST_DIR/current" && "$FWSEC_VERSION" == 1.6.1 ]]
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_readonly_functions_never_install_packages(self):
         text = (ROOT / "install.sh").read_text()
         start = text.index('if [[ "$PREFLIGHT_ONLY" -eq 1 || "$VERIFY_ONLY" -eq 1 ]]; then',

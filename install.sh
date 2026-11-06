@@ -731,7 +731,10 @@ install_fwsec_package() {
 # =============================================================================
 install_config_files() {
     info "Installing configuration files in ${CONFIG_DIR}..."
-    mkdir -p "$CONFIG_DIR"
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        chmod 750 "$CONFIG_DIR"
+    fi
 
     for f in fwsec.conf fwsec.allow fwsec.deny fwsec.ignore; do
         local src="${SCRIPT_DIR}/etc/fwsec/${f}"
@@ -740,6 +743,7 @@ install_config_files() {
             ok "  ${f}: preserved (already exists)."
         elif [[ -f "$src" ]]; then
             cp "$src" "$dst"
+            chmod 640 "$dst"
             if [[ "$f" == "fwsec.conf" ]]; then CONF_IS_NEW=1; fi
             ok "  ${f}: installed."
         else
@@ -747,11 +751,6 @@ install_config_files() {
         fi
     done
 
-    chmod 750 "$CONFIG_DIR"
-    chmod 640 "${CONFIG_DIR}"/*.conf \
-              "${CONFIG_DIR}"/*.allow \
-              "${CONFIG_DIR}"/*.deny \
-              "${CONFIG_DIR}"/*.ignore 2>/dev/null || true
 }
 
 # =============================================================================
@@ -929,6 +928,10 @@ bootstrap_source() {
     local ver src_dir
     ver=$(fetch_remote_version)
     src_dir=$(download_source "${ver:-main}") || die "Could not download the fwsec source from ${REPO}."
+    if [[ ! -f "${src_dir}/src/fwsec/installer.py" ]]; then
+        info "Published release predates this installer contract; using current main source."
+        src_dir=$(download_source main) || die "Could not download compatible source; use a current source checkout."
+    fi
     SCRIPT_DIR="$src_dir"
     FWSEC_VERSION=$(grep -E '^version[[:space:]]*=' "${SCRIPT_DIR}/pyproject.toml" \
                     | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
