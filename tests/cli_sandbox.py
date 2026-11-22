@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from fwsec import cli, config, geo, nft, state, transaction
+from fwsec import cli, config, geo, hypervisor, nft, state, transaction
 
 
 def call(*args: str, expected: int = 0) -> str:
@@ -18,6 +18,7 @@ def call(*args: str, expected: int = 0) -> str:
     code = 0
     with patch("sys.argv", ["fwsec", *args]), \
             patch.object(cli, "_detect_ssh_ports", return_value=[22]), \
+            patch.object(hypervisor, "detect", return_value=[]), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         try:
             cli.main()

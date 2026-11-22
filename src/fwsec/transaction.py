@@ -65,6 +65,8 @@ def validate(c: config.FwsecConfig, ssh_ports: list[int]) -> None:
         raise ValueError("No valid SSH listening port detected.")
     if c.container_policy not in ("open", "filtered"):
         raise ValueError("CONTAINER_POLICY must be open or filtered.")
+    if c.vm_policy not in ("open", "filtered"):
+        raise ValueError("VM_POLICY must be open or filtered.")
     if c.output_policy not in ("accept", "drop"):
         raise ValueError("OUTPUT_POLICY must be accept or drop.")
     for cc in c.geo_allow + c.geo_block:
@@ -248,6 +250,11 @@ def snapshot(adopt: bool = False) -> dict[str, Any]:
 
 def _elements(name: str, values: list[str]) -> str:
     return (f"add element inet fwsec {name} {{ {', '.join(values)} }}\n" if values else "")
+
+
+def vm_filtered(c: config.FwsecConfig) -> bool:
+    """VM_POLICY = filtered is only enforced in hypervisor mode."""
+    return c.hypervisor_mode and c.vm_policy == "filtered"
 
 
 def build(c: config.FwsecConfig, ssh_ports: list[int], before: dict[str, Any],
@@ -466,7 +473,8 @@ def static_receipt(rows: list[dict[str, Any]], ports: list[int]) -> dict[str, An
         if "set" in copy:
             copy["set"].pop("elem", None)  # Dynamic list contents/expiry are not static rules.
         selected.append(copy)
-    specs = compat.hooks(c, c.container_mode and c.container_policy == "filtered")
+    specs = compat.hooks(c, c.container_mode and c.container_policy == "filtered",
+                         vms=vm_filtered(c))
     kernel = {name: compat.objects(selected, name, name, specs[name])
               for name in ("filter", "fwsec")}
     return {"config": effective, "ssh_ports": ports, "kernel": kernel}

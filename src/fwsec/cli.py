@@ -24,6 +24,7 @@ from fwsec import (
     containers,
     crowdsec,
     geo,
+    hypervisor,
     migration,
     nft,
     rules,
@@ -254,13 +255,16 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
             before["files"][name] = ({"text": path.read_text(),
                                       "mode": path.stat().st_mode & 0o777} if path else None)
     extra = ""
-    if c.container_mode and c.container_policy == "filtered":
+    container_filtered = c.container_mode and c.container_policy == "filtered"
+    if container_filtered:
         published = containers.externally_published_ports()
         extra = rules.generate_container_filter(
             [p.host_port for p in published if p.proto == "tcp"],
             [p.host_port for p in published if p.proto == "udp"],
             containers.container_networks(),
         )
+    if transaction.vm_filtered(c):
+        extra += rules.generate_vm_filter(hypervisor.vm_networks())
     script = transaction.build(c, ssh_ports, before, extra)
     if getattr(_args, "upgrade_apply", False):
         if not c.enabled or not before["fwsec"] or len(before["chains"]) != 3:
@@ -271,7 +275,7 @@ def cmd_start(_args: argparse.Namespace) -> str | None:
             transaction.snapshot()
         except RuntimeError:
             probe = transaction.build(c, ssh_ports, {"fwsec": "", "chains": {}}, extra)
-            compat.prove(c, probe, filtered=bool(extra))
+            compat.prove(c, probe, filtered=container_filtered)
         _args.apply_safe = True
         _args.timeout = 180
     if getattr(_args, "dry_run", False):

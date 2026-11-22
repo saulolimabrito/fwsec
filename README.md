@@ -474,6 +474,10 @@ IPV6       = 1           # Enable IPv6 support
 CONTAINER_MODE   = 0     # 1 = host runs containers (Docker/Podman/nerdctl)
 CONTAINER_POLICY = open  # open | filtered (restrict published ports to the allow list)
 
+[hypervisor]
+HYPERVISOR_MODE = 0      # 1 = KVM/libvirt, Proxmox or Xen host (permissive forward chain)
+VM_POLICY       = open   # open | filtered (allow list required for new connections into libvirt VM networks)
+
 [crowdsec]
 ENABLED    = 1           # Enable CrowdSec integration
 SYNC_DENY  = 1           # Synchronize fwsec -d bans with CrowdSec decisions
@@ -547,6 +551,46 @@ During installation, fwsec detects Docker, Podman, and nerdctl. When a runtime i
 4. Adds the detected container network subnets to `fwsec.ignore`, so internal container traffic is never banned (a busy internal proxy is a classic false positive).
 5. Offers to enable CrowdSec log acquisition for containers (`/etc/crowdsec/acquis.d/fwsec-docker.yaml`, using `use_container_labels: true`), so attacks against containerized applications also generate bans. Label your containers (e.g. `crowdsec.labels.type=nginx`) so CrowdSec parses their logs with the right collection.
 6. Prints default security recommendations: bind internal-only services to localhost (`-p 127.0.0.1:5432:5432`), never expose the engine socket (`docker.sock`), prefer rootless mode, and keep images from trusted registries.
+
+## Virtualization hosts (KVM / libvirt · Proxmox VE · Xen)
+
+By default the main filter's forward chain drops everything, which breaks NAT/routed
+VM networking such as libvirt's default `virbr0`. `HYPERVISOR_MODE = 1` keeps the
+forward chain permissive, like container mode. The fwsec allow/deny lists, geo on the
+forward hook (`GEO_FORWARD = 1`) and CrowdSec bans still apply to forwarded VM traffic.
+
+```ini
+[hypervisor]
+HYPERVISOR_MODE = 1
+VM_POLICY = filtered   # open | filtered
+```
+
+- **VM DNS/DHCP:** libvirt's dnsmasq serves its NAT/routed networks from the host. In
+  hypervisor mode, fwsec accepts DNS (53), DHCP (67) and DHCPv6 (547) arriving on `virbr*`
+  bridges, and with `OUTPUT_POLICY = drop` also the DHCP replies. Without this, VMs would
+  get no address. The installer no longer opens 53/67 on every interface just because
+  dnsmasq listens on `virbr*`.
+- **`VM_POLICY = filtered`** adds the `inet fwsec / vms` chain (forward, priority -55).
+  It is built from the active libvirt NAT/routed networks (`virsh net-dumpxml`, IPv4 and
+  IPv6) each time rules are applied, and drops **new** connections into those subnets
+  unless the source is allow-listed. VM outbound traffic, replies and inter-VM traffic keep
+  working. Re-apply (`fwsec -r`) after adding a libvirt network.
+- **Bridged VMs** (Proxmox `vmbr0`, VMs on the host's LAN) are layer 2. They reach the
+  nftables forward hook only when `br_netfilter` is loaded with
+  `net.bridge.bridge-nf-call-iptables = 1`. `fwsec --status` reports that state instead of
+  letting it change filtering silently. Without it, bridged VMs bypass fwsec entirely,
+  including bans. `VM_POLICY` never covers bridged VMs, because there is no host-routed
+  subnet to match.
+- **Proxmox VE:** run a single firewall manager per host. `fwsec --status` warns when
+  `pve-firewall` is active alongside fwsec. The installer reports it but never stops it.
+
+On a libvirt host, a fresh install accepts libvirt's own `LIBVIRT_*` iptables chains and its
+`libvirt_network` nftables tables. They coexist with fwsec and are never replaced. Any
+other existing rule still stops the installation, and the installer lists those rules.
+
+The installer enables hypervisor mode when it detects Proxmox (`/etc/pve`), libvirt
+(`virsh`) or Xen (`xl` + `/proc/xen`). It reports the VM bridges and the `br_netfilter`
+state, and asks about `VM_POLICY` interactively. The default is `open`.
 
 ## CrowdSec integration
 

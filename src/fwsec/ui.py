@@ -14,7 +14,17 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from fwsec import config, containers, crowdsec, geo, migration, nft, state, transaction
+from fwsec import (
+    config,
+    containers,
+    crowdsec,
+    geo,
+    hypervisor,
+    migration,
+    nft,
+    state,
+    transaction,
+)
 
 SCHEMA = 1
 
@@ -43,6 +53,41 @@ def decisions() -> tuple[list[dict[str, Any]] | None, str | None]:
         return [asdict(d) for d in crowdsec.list_decisions(strict=True)], None
     except RuntimeError as exc:
         return None, str(exc)
+
+
+def hypervisor_status(c: config.FwsecConfig) -> dict[str, Any]:
+    """VM host diagnostics: explain silent forwarding/br_netfilter effects."""
+    detected = hypervisor.detect()
+    vm_bridges = hypervisor.vm_bridges() if detected else []
+    routed = hypervisor.libvirt_networks() if "libvirt" in detected else {}
+    networks = hypervisor.vm_networks(routed)
+    # NAT/routed bridges (virbr0) are routed through fwsec; only bridges that
+    # put VMs on the host's LAN depend on br_netfilter.
+    lan_bridges = [b for b in vm_bridges if b not in routed]
+    br_nf = hypervisor.br_netfilter()
+    pve = "proxmox" in detected and hypervisor.pve_firewall_active()
+    warnings = []
+    if detected and not config.forwarding(c):
+        warnings.append(f"Hypervisor detected ({', '.join(detected)}) but HYPERVISOR_MODE = 0: "
+                        "the forward chain drops VM traffic. Set HYPERVISOR_MODE = 1.")
+    if lan_bridges and c.hypervisor_mode:
+        names = ", ".join(lan_bridges)
+        if br_nf["ipv4"] is None:
+            warnings.append(f"br_netfilter is not loaded: VMs bridged on {names} bypass fwsec "
+                            "entirely (allow/deny, geo and CrowdSec bans do not protect them).")
+        elif not br_nf["ipv4"]:
+            warnings.append(f"net.bridge.bridge-nf-call-iptables = 0: IPv4 traffic of VMs "
+                            f"bridged on {names} bypasses fwsec.")
+    if pve:
+        warnings.append("pve-firewall is active alongside fwsec: two managers filter the same "
+                        "host. Disable one of them (pve-firewall stop/disable, or fwsec -x).")
+    if transaction.vm_filtered(c) and not networks:
+        warnings.append("VM_POLICY = filtered but no active libvirt NAT/routed network was "
+                        "found; nothing is restricted.")
+    return {"mode": c.hypervisor_mode, "policy": c.vm_policy, "detected": detected,
+            "vm_bridges": vm_bridges, "lan_bridges": lan_bridges, "vm_networks": networks,
+            "br_netfilter": br_nf,
+            "pve_firewall": pve, "warnings": warnings}
 
 
 def health(ports: list[int]) -> dict[str, Any]:
@@ -86,6 +131,8 @@ def health(ports: list[int]) -> dict[str, Any]:
                         ". Review fwsec --dry-run before using --apply-safe.")
     if verified == "changed":
         problems.append("Configuration or static kernel rules changed since the last apply.")
+    hv = hypervisor_status(c)
+    warnings.extend(hv.pop("warnings"))
     bans, error = decisions() if c.crowdsec_enabled else (None, None)
     cs_status = "disabled" if not c.crowdsec_enabled else (
         "unavailable" if error else "operational")
@@ -119,7 +166,7 @@ def health(ports: list[int]) -> dict[str, Any]:
             "static_rules": verified, "pending": pending, "crowdsec": cs_status,
             "crowdsec_bans": len(bans) if bans is not None else None,
             "ssh_ports": ports, "output_policy": "inherited" if c.inherited_policy else
-            c.output_policy, "container_mode": c.container_mode,
+            c.output_policy, "container_mode": c.container_mode, "hypervisor": hv,
             "allow_entries": len(config.read_allow()), "deny_entries": len(config.read_deny()),
             "problems": problems, "warnings": warnings,
             "verification_scope": "Configuration and static rules; not end-to-end reachability."}
@@ -147,6 +194,9 @@ def listing(args: Any, ports: list[int]) -> dict[str, Any]:
     result["ipv6"] = c.ipv6
     result["containers"] = {"mode": c.container_mode, "policy": c.container_policy,
                              "published": [asdict(p) for p in containers.published_ports()]}
+    result["hypervisor"] = {"mode": c.hypervisor_mode, "policy": c.vm_policy,
+                            "vm_networks": (hypervisor.vm_networks()
+                                            if transaction.vm_filtered(c) else [])}
     result["geo"] = {"mode": config.geo_mode(c), "countries": c.geo_block or c.geo_allow}
     if not result["policy_loaded"]:
         result["warnings"].append("Kernel policy is not loaded; local active lists are unknown.")
@@ -232,6 +282,17 @@ def render(command: str, data: dict[str, Any], args: Any) -> None:
         for p in data["pending"]:
             cli._warn(f"Pending {p['id']}: {p['remaining_seconds']}s remaining. "
                       f"Confirm: fwsec --confirm {p['id']} | cancel: fwsec --rollback {p['id']}")
+        hv = data["hypervisor"]
+        if hv["mode"] or hv["detected"]:
+            print(f"  {'Hypervisor':<20}: {', '.join(hv['detected']) or 'none detected'}; "
+                  f"mode {int(hv['mode'])}, VM_POLICY {hv['policy']}")
+            if hv["vm_bridges"]:
+                print(f"  {'VM bridges':<20}: {', '.join(map(safe, hv['vm_bridges']))}")
+            if hv["vm_networks"]:
+                print(f"  {'VM networks':<20}: {', '.join(hv['vm_networks'])}")
+            br = hv["br_netfilter"]
+            print(f"  {'br_netfilter':<20}: " + ("not loaded" if br["ipv4"] is None else
+                  f"ipv4={int(bool(br['ipv4']))} ipv6={int(bool(br['ipv6']))}"))
         cli._info(data["verification_scope"])
         for problem in data["problems"]:
             cli._err(problem)
@@ -248,6 +309,9 @@ def render(command: str, data: dict[str, Any], args: Any) -> None:
         for port in data["containers"]["published"]:
             print(f"    {safe(port['host_ip'])}:{port['host_port']}/{port['proto']} → "
                   f"{safe(port['container'])}:{port['container_port']}")
+        hv = data["hypervisor"]
+        print(f"  VM forwarding: {hv['mode']} ({hv['policy']})" + (
+            f" — filtered networks: {', '.join(hv['vm_networks'])}" if hv["vm_networks"] else ""))
         print(f"  OUTPUT policy: {data['output_policy']}" + (
             " — new outbound connections are not restricted by TCP_OUT/UDP_OUT"
             if data["output_policy"] == "accept" else ""))
