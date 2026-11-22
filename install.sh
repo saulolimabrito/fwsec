@@ -403,7 +403,12 @@ install_uv() {
     fi
 
     info "Installing uv (standalone installer)..."
-    fetch "https://astral.sh/uv/install.sh" | env HOME=/root sh >/dev/null 2>&1 || true
+    # UV_NO_MODIFY_PATH: never edit root's shell profiles or, under GitHub
+    # Actions, $GITHUB_PATH. The latter makes the runner rebuild PATH for later
+    # steps from that entry alone in images without a PATH (rockylinux:9),
+    # leaving no sh. The PATH export below is all this installer needs.
+    fetch "https://astral.sh/uv/install.sh" \
+        | env -u GITHUB_PATH HOME=/root UV_NO_MODIFY_PATH=1 sh >/dev/null 2>&1 || true
     export PATH="/root/.local/bin:${HOME}/.local/bin:$PATH"
 
     command -v uv &>/dev/null || die "uv was not found after installation."

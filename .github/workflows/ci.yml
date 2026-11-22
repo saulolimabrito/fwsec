@@ -160,7 +160,7 @@ jobs:
             fedora) dnf install -y -q git curl tar >/dev/null ;;
             amzn) dnf install --allowerasing -y -q git curl tar >/dev/null ;;
             opensuse-leap|sles) zypper --non-interactive install git curl tar ca-certificates >/dev/null ;;
-            arch) pacman -Sy --noconfirm git curl >/dev/null ;;
+            arch) pacman -Syu --noconfirm git curl >/dev/null ;;
           esac
       - uses: actions/checkout@v4
       - name: Install code without NET_ADMIN (--install-only)
