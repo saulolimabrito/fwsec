@@ -288,6 +288,11 @@ def render(document: dict[str, Any]) -> str:
         hook = direction.lower()
         output.append(f"chain fwsec_inherited_{hook} {{")
         output.append(f"    type filter hook {hook} priority 0; policy accept;")
+        if direction != "OUTPUT":
+            # fwsec.allow takes precedence over the inherited policy, as
+            # csf.allow does in CSF (same table: the sets are reachable).
+            output.append("    ip saddr @allow4 accept")
+            output.append("    ip6 saddr @allow6 accept")
         for version, nfproto in ((4, "ipv4"), (6, "ipv6")):
             output.append(f"    meta nfproto {nfproto} jump {chain_name(version, direction)}")
         output.append("}")

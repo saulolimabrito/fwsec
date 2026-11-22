@@ -17,10 +17,25 @@ from fwsec.config import FwsecConfig, geo_mode
 
 FILTER_TABLE = "inet filter"
 
-# Connection mark used by WHITELIST_MARK: allow-listed sources are tagged so
-# hardened hosts can accept them early in later-priority chains (management
-# guards). See WHITELIST_MARK in fwsec.conf.
+# Packet mark carried by allow-listed sources. In nftables an `accept` only
+# ends the current base chain: the packet still traverses every later base
+# chain on the same hook (deny list -50, geo -40, the main filter 0, foreign
+# tables). The whitelist chain (-100) therefore tags allow-listed packets and
+# every later fwsec chain accepts the tag first, so fwsec.allow really takes
+# precedence over the deny list, CrowdSec bans and the port policy.
+#
+# By default the tag is OR-ed into the existing mark (other owners' bits are
+# preserved) and matched with a mask. WHITELIST_MARK = 1 keeps the historical
+# exact value so management guards at later priorities can match it.
 WHITELIST_MARK_VALUE = "0x46575345"
+
+
+def allow_mark(cfg: FwsecConfig) -> tuple[str, str]:
+    """Return (statement that tags, expression that matches) the allow mark."""
+    value = WHITELIST_MARK_VALUE
+    if cfg.whitelist_mark:
+        return f"meta mark set {value}", f"meta mark {value}"
+    return f"meta mark set meta mark | {value}", f"meta mark & {value} == {value}"
 
 
 def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
@@ -31,31 +46,37 @@ def generate_filter_table(cfg: FwsecConfig, ssh_ports: list[int]) -> str:
     every one of them must stay open or you get locked out of the server.
     """
 
+    _, mark_match = allow_mark(cfg)
+    mark_accept = f"{mark_match} accept"
+
     if cfg.inherited_policy:
         migration.load(cfg.inherited_policy)
         # The complete inherited policy is enforced in inet fwsec. The shared
         # filter chains remain CrowdSec guards, not a second port/default policy
         # that would silently narrow or widen the original IPv4/IPv6 rules.
-        return '''
+        # Allow-listed sources bypass the CrowdSec guards, as everywhere else.
+        return f'''
 add table inet filter
 flush table inet filter
-table inet filter {
-    set crowdsec-blacklists { type ipv4_addr; flags timeout; }
-    set crowdsec6-blacklists { type ipv6_addr; flags timeout; }
-    chain input {
+table inet filter {{
+    set crowdsec-blacklists {{ type ipv4_addr; flags timeout; }}
+    set crowdsec6-blacklists {{ type ipv6_addr; flags timeout; }}
+    chain input {{
         type filter hook input priority 0; policy accept;
+        {mark_accept}
         ip saddr @crowdsec-blacklists drop
         ip6 saddr @crowdsec6-blacklists drop
-    }
-    chain forward {
+    }}
+    chain forward {{
         type filter hook forward priority 0; policy accept;
+        {mark_accept}
         ip saddr @crowdsec-blacklists drop
         ip6 saddr @crowdsec6-blacklists drop
-    }
-    chain output {
+    }}
+    chain output {{
         type filter hook output priority 0; policy accept;
-    }
-}
+    }}
+}}
 '''
 
     # Remove SSH ports from tcp_in to avoid duplicate rules
@@ -82,11 +103,10 @@ table inet filter {
         if ssh_ports else ""
     )
 
-    # WHITELIST_MARK: tag allow-listed sources with a connection mark that
-    # management-guard chains at later priorities accept early.
-    mark_accept = f"meta mark {WHITELIST_MARK_VALUE} accept" if cfg.whitelist_mark else ""
-    bypass_input = f"        {mark_accept}\n" if cfg.whitelist_mark else ""
-    bypass_forward = f"\n        {mark_accept}" if cfg.whitelist_mark else ""
+    # Allow-listed sources (tagged by inet fwsec/whitelist) are accepted before
+    # invalid-state, CrowdSec, port and default-policy decisions.
+    bypass_input = f"        {mark_accept}\n"
+    bypass_forward = f"\n        {mark_accept}"
     output_safety = ""
     if cfg.output_policy == "drop":
         output_safety = '''
@@ -243,18 +263,14 @@ table inet fwsec {
 def generate_fwsec_table(cfg: FwsecConfig) -> str:
     """Generate the `inet fwsec` table (allow/deny sets + hook chains).
 
-    With WHITELIST_MARK = 1, allow-listed sources are additionally tagged
-    with a connection mark (WHITELIST_MARK_VALUE) that hardened hosts accept
-    early in later-priority chains (e.g. a management guard).
+    Allow-listed sources are tagged with the allow mark (see allow_mark) so
+    every later base chain accepts them; an `accept` alone would not stop the
+    deny list or the main filter from dropping them.
     """
-    if cfg.whitelist_mark:
-        allow4_rule = "ip  saddr @allow4 meta mark set " + WHITELIST_MARK_VALUE + " accept"
-        allow6_rule = "ip6 saddr @allow6 meta mark set " + WHITELIST_MARK_VALUE + " accept"
-        mark_accept = "        meta mark " + WHITELIST_MARK_VALUE + " accept\n"
-    else:
-        allow4_rule = "ip  saddr @allow4 accept"
-        allow6_rule = "ip6 saddr @allow6 accept"
-        mark_accept = ""
+    mark_set, mark_match = allow_mark(cfg)
+    allow4_rule = f"ip  saddr @allow4 {mark_set} accept"
+    allow6_rule = f"ip6 saddr @allow6 {mark_set} accept"
+    mark_accept = f"        {mark_match} accept\n"
     return (
         FWSEC_TABLE_TEMPLATE
         .replace("@@ALLOW4_RULE@@", allow4_rule)
