@@ -372,7 +372,7 @@ fwsec -a 10.0.0.0/8 "Internal network"
 fwsec -ar 1.2.3.4
 ```
 
-> Allow-listed IP addresses have the highest priority and are accepted before every blocking rule, including CrowdSec rules.
+> Allow-listed IP addresses have the highest priority: they reach every port and are accepted before every blocking rule, including the deny list, geo policy and CrowdSec bans (IPv4 and IPv6, input and forward hooks). In 1.6.1 and earlier an allow-listed address was still dropped by the deny list, CrowdSec and the port policy unless `WHITELIST_MARK = 1`.
 
 ### Search for an IP address or domain
 
@@ -487,26 +487,39 @@ fwsec operates with two parallel nftables tables:
 Inbound packet
       |
       v
-+---------------------------------------------+
-| table inet fwsec / chain whitelist          | priority -100
-| ip saddr @allow4 -> ACCEPT immediately      |
-+---------------------------------------------+
-      | (not allow-listed)
++-----------------------------------------------+
+| table inet fwsec / chain whitelist            | priority -100
+| ip saddr @allow4 -> tag allow mark, ACCEPT    |
++-----------------------------------------------+
+      |  (an nftables ACCEPT only ends this base chain:
+      |   every packet continues to the next priority)
       v
-+---------------------------------------------+
-| table inet fwsec / chain blacklist          | priority -50
-| ip saddr @deny4 -> DROP                     |
-+---------------------------------------------+
-      | (not deny-listed)
++-----------------------------------------------+
+| table inet fwsec / chain blacklist            | priority -50
+| allow mark -> ACCEPT                          |
+| ip saddr @deny4 -> DROP                       |
++-----------------------------------------------+
       v
-+---------------------------------------------+
-| table inet filter / chain input             | priority 0
-| established/related -> ACCEPT               |
-| @crowdsec-blacklists -> DROP                |
-| tcp dport <SSH> -> ACCEPT                   |
-| policy: DROP                                |
-+---------------------------------------------+
++-----------------------------------------------+
+| table inet fwsec / chain geo_blacklist        | priority -40 (only with geo)
+| @allow4 -> ACCEPT, @geo4 -> DROP / ACCEPT     |
++-----------------------------------------------+
+      v
++-----------------------------------------------+
+| table inet filter / chain input               | priority 0
+| allow mark -> ACCEPT                          |
+| established/related -> ACCEPT                 |
+| @crowdsec-blacklists -> DROP                  |
+| tcp dport <SSH> / TCP_IN -> ACCEPT            |
+| policy: DROP                                  |
++-----------------------------------------------+
 ```
+
+Only a DROP is final across base chains, so the whitelist chain tags allow-listed
+packets with the mark `0x46575345` and each later fwsec chain accepts that mark
+first. By default the bits are OR-ed into the packet mark (other owners' bits are
+kept) and matched with a mask; `WHITELIST_MARK = 1` sets the exact value instead,
+for management guards in later-priority tables that match it.
 
 - **`@allow4` / `@allow6`** — sets managed by `fwsec -a`
 - **`@deny4` / `@deny6`** — sets managed by `fwsec -d` and `fwsec -td`, with native timeouts

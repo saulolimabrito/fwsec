@@ -62,8 +62,11 @@ class GeoSectionTest(unittest.TestCase):
     def test_no_geo_regression_on_default(self):
         cfg = FwsecConfig()
         table = rules.generate_fwsec_table(cfg)
-        self.assertNotIn("meta mark", table)  # WHITELIST_MARK=0
-        self.assertIn("ip  saddr @allow4 accept", table)
+        # WHITELIST_MARK=0: allow-listed sources are tagged without
+        # clobbering foreign mark bits; no geo objects without a geo policy.
+        self.assertNotIn("meta mark set 0x46575345", table)
+        self.assertIn("ip  saddr @allow4 meta mark set meta mark | 0x46575345 accept", table)
+        self.assertNotIn("@geo4", table)
 
 
 if __name__ == "__main__":
