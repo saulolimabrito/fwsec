@@ -63,6 +63,8 @@ jobs:
         run: sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/cli_sandbox.py
       - name: Allow list precedence with real IPv4 and IPv6 packets
         run: sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/allow_sandbox.py
+      - name: Hypervisor forwarding and VM network policy with real packets
+        run: sudo env PYTHONPATH="$PWD/src" unshare --net .nft-venv/bin/python tests/hypervisor_sandbox.py
 
   legacy-nft:
     name: Real legacy nftables — ${{ matrix.container }}
@@ -85,7 +87,8 @@ jobs:
             runtime=$(awk "NR==2 {gsub(/\"/, \"\", \$2); print \$2}" /usr/local/bin/fwsec)
             export PYTHONPATH=/src/src
             nft --version
-            for test in nft_sandbox.py upgrade_sandbox.py cli_sandbox.py allow_sandbox.py; do
+            for test in nft_sandbox.py upgrade_sandbox.py cli_sandbox.py allow_sandbox.py \
+                        hypervisor_sandbox.py; do
               unshare --net "$runtime" "tests/$test"
             done
             for source in ufw csf; do

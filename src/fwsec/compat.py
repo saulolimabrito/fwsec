@@ -63,14 +63,15 @@ def equivalent(left: Any, right: Any, key: str = "") -> bool:
     return bool(left == right)
 
 
-def hooks(c: config.FwsecConfig, filtered: bool) -> dict[str, dict[str, dict[str, Any]]]:
+def hooks(c: config.FwsecConfig, filtered: bool,
+          vms: bool = False) -> dict[str, dict[str, dict[str, Any]]]:
     def spec(hook: str, priority: int, policy: str = "accept") -> dict[str, Any]:
         return {"type": "filter", "hook": hook, "prio": priority, "policy": policy}
 
     result = {
         "filter": {
             "input": spec("input", 0, "drop"),
-            "forward": spec("forward", 0, "accept" if c.container_mode else "drop"),
+            "forward": spec("forward", 0, "accept" if config.forwarding(c) else "drop"),
             "output": spec("output", 0, c.output_policy),
         },
         "fwsec": {
@@ -87,6 +88,8 @@ def hooks(c: config.FwsecConfig, filtered: bool) -> dict[str, dict[str, dict[str
             result["fwsec"]["geo_blacklist_forward"] = spec("forward", -40, policy)
     if filtered:
         result["fwsec"]["containers"] = spec("forward", -60)
+    if vms:
+        result["fwsec"]["vms"] = spec("forward", -55)
     return result
 
 
@@ -150,7 +153,7 @@ def prove(c: config.FwsecConfig, candidate: str, filtered: bool = False) -> None
         nft._run_script(probe)
         created = True
         rows = transaction._objects()
-        specs = hooks(c, filtered)
+        specs = hooks(c, filtered, vms=transaction.vm_filtered(c))
         for original, scratch in names.items():
             if any(row.get("chain", {}).get("table") == scratch
                    and "hook" in row["chain"] for row in rows):

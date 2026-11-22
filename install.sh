@@ -637,14 +637,46 @@ remove_migrated_firewall() {
     MIGRATION_SUMMARY+=("Next           : confirm from a NEW SSH session, then fwsec --migration-finalize")
 }
 
+# libvirt's own NAT/DHCP/DNS rules (LIBVIRT_* chains, or its libvirt_network
+# nftables tables) only accept or reject VM traffic in their own tables and
+# coexist with fwsec, which never replaces them. Anything else is unidentified.
+_LIBVIRT_XTABLES='^-A LIBVIRT_[A-Z]+ |^-A (INPUT|FORWARD|OUTPUT|POSTROUTING) -j LIBVIRT_[A-Z]+$'
+
+_unowned_xtables_rules() {
+    local save out
+    for save in iptables-save ip6tables-save; do
+        command -v "$save" &>/dev/null || continue
+        out=$("$save" 2>&1 || true)
+        # iptables-nft cannot show native nft rules in a same-named table.
+        if grep -q 'incompatible' <<<"$out"; then
+            echo "${save}: native nftables rules in an xtables table"
+        fi
+        grep '^-A ' <<<"$out" | grep -vE "$_LIBVIRT_XTABLES" || true
+    done
+}
+
+_unowned_nft_hooks() {
+    # Hooked tables other than xtables-nft ones (audited by the rules above)
+    # and libvirt's own nftables backend.
+    nft list ruleset 2>/dev/null | awk '
+        /^table / { table = $2 " " $3; next }
+        /hook (input|output|forward)/ { print table }' | sort -u \
+        | grep -vxE '(ip|ip6) (filter|mangle|nat|raw|security)|(ip|ip6) libvirt_network' || true
+}
+
 run_migration_stage() {
     if [[ -z "$MIGRATION_SOURCES" ]]; then
         if ! command -v fwsec &>/dev/null; then
-            if iptables-save 2>/dev/null | grep '^-A ' >/dev/null; then
-                die "Unidentified existing iptables rules: refuse automatic replacement."
+            local foreign
+            foreign=$(_unowned_xtables_rules)
+            if [[ -n "$foreign" ]]; then
+                while read -r line; do warn "  $line"; done < <(head -n 20 <<<"$foreign")
+                die "Unidentified existing iptables rules (above): refuse automatic replacement."
             fi
-            if nft list ruleset 2>/dev/null | grep -E 'hook (input|output|forward)' >/dev/null; then
-                die "Unidentified existing nftables hooks: inspect ownership before installation."
+            foreign=$(_unowned_nft_hooks)
+            if [[ -n "$foreign" ]]; then
+                while read -r line; do warn "  table $line"; done <<<"$foreign"
+                die "Unidentified existing nftables hooks (above): inspect ownership before installation."
             fi
         fi
         return 0
@@ -1117,13 +1149,19 @@ _list_listeners() {
     # $1 = t|u — prints "port service" pairs, skipping loopback-only listeners.
     # Uses ss (iproute2); falls back to netstat (busybox/bsd variant) when ss
     # is unavailable or produces no output.
-    local out=""
+    local out="" vmaddrs
+    # libvirt's dnsmasq serves only its own VM networks (virbr*); fwsec allows
+    # that DNS/DHCP in hypervisor mode, so it must not open ports everywhere.
+    vmaddrs=$(ip -o addr show 2>/dev/null | awk '$2 ~ /^virbr/ { split($4, a, "/"); printf "%s ", a[1] }' || true)
     if command -v ss &>/dev/null; then
-        out=$(ss -H "-${1}lnp" 2>/dev/null | awk '
+        out=$(ss -H "-${1}lnp" 2>/dev/null | awk -v vmaddrs=" ${vmaddrs}" '
         {
             n = split($4, a, ":"); port = a[n]
             addr = substr($4, 1, length($4) - length(port) - 1)
             if (addr ~ /^127\./ || addr == "[::1]") next
+            if (addr ~ /%virbr/) next
+            bare = addr; gsub(/[][]/, "", bare); sub(/%.*/, "", bare)
+            if (index(vmaddrs, " " bare " ")) next
             if (port !~ /^[0-9]+$/) next
             svc = "-"
             if (match($0, /\(\("[^"]+"/)) svc = substr($0, RSTART + 3, RLENGTH - 4)
@@ -1406,6 +1444,79 @@ configure_containers() {
 }
 
 # =============================================================================
+# Hypervisor hosts (KVM/libvirt, Proxmox VE, Xen)
+# =============================================================================
+detect_hypervisors() {
+    HYPERVISORS=""
+    if [[ -d /etc/pve ]] || command -v pveversion &>/dev/null; then HYPERVISORS+="proxmox "; fi
+    if command -v virsh &>/dev/null; then HYPERVISORS+="libvirt "; fi
+    if command -v xl &>/dev/null && [[ -e /proc/xen ]]; then HYPERVISORS+="xen "; fi
+    HYPERVISORS="${HYPERVISORS% }"
+}
+
+configure_hypervisor() {
+    local conf="${CONFIG_DIR}/fwsec.conf"
+    [[ -f "$conf" ]] || return 0
+    detect_hypervisors
+    # Older configs lack the section; defaults keep forwarding unchanged.
+    if ! grep -q '^\[hypervisor\]' "$conf"; then
+        printf '\n[hypervisor]\nHYPERVISOR_MODE = 0\nVM_POLICY = open\n' >> "$conf"
+    fi
+    if [[ -z "$HYPERVISORS" ]]; then
+        set_conf_value "HYPERVISOR_MODE" "0"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}${CYAN}--------------------------------------------${NC}"
+    echo -e "${BOLD}${CYAN}  Virtualization host${NC}"
+    echo -e "${BOLD}${CYAN}--------------------------------------------${NC}"
+    echo ""
+    ok "Hypervisor(s) detected: ${BOLD}${HYPERVISORS}${NC}"
+    set_conf_value "HYPERVISOR_MODE" "1"
+    ok "Hypervisor mode: enabled (forward chain stays permissive; bans still apply)."
+
+    # NAT/routed libvirt bridges (virbr*) are routed through fwsec; only
+    # bridges that put VMs on the host's LAN depend on br_netfilter.
+    local bridges
+    bridges=$(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 \
+              | grep -vE '^(virbr|docker|podman|cni|br-|lxcbr|lxdbr|incusbr|nerdctl|cbr|flannel|kube|cilium)' \
+              | tr '\n' ' ' || true)
+    if [[ "$HYPERVISORS" == *libvirt* ]]; then
+        info "libvirt NAT/routed VMs (virbr*) are routed through fwsec; their DNS/DHCP is allowed."
+    fi
+    if [[ -n "${bridges// /}" ]]; then
+        info "Bridges with VMs on the LAN: ${bridges}"
+        if [[ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true)" == "1" ]]; then
+            ok "br_netfilter active: bridged VM traffic passes through fwsec."
+        else
+            warn "br_netfilter inactive: bridged VMs bypass fwsec (allow/deny, geo, CrowdSec bans)."
+            info "To filter bridged VMs: modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1"
+        fi
+    fi
+
+    local policy="open"
+    if [[ -t 0 && "$HYPERVISORS" == *libvirt* ]]; then
+        local answer=""
+        echo ""
+        info "VM_POLICY controls new inbound connections into libvirt NAT/routed VM networks:"
+        info "  open     — any source"
+        info "  filtered — only IPs in the fwsec allow list (VM outbound keeps working)"
+        read -r -p "$(echo -e "  ${BOLD}Restrict inbound connections to VM networks to the allow list?${NC} [y/N]: ")" answer || answer=""
+        if [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
+            policy="filtered"
+        fi
+    fi
+    set_conf_value "VM_POLICY" "$policy"
+    ok "VM network policy: ${policy}."
+
+    if [[ "$HYPERVISORS" == *proxmox* ]] && systemctl is-active --quiet pve-firewall 2>/dev/null; then
+        warn "pve-firewall is active. Two firewall managers on one host conflict."
+        info "fwsec does not change it. To let fwsec manage the host: pve-firewall stop && systemctl disable pve-firewall"
+    fi
+}
+
+# =============================================================================
 # CrowdSec container log acquisition
 # =============================================================================
 configure_crowdsec_container_logs() {
@@ -1615,6 +1726,7 @@ main() {
     install_config_files
     configure_ports_if_needed
     [[ "$MIGRATION_STAGED" -eq 1 ]] || configure_containers
+    [[ "$MIGRATION_STAGED" -eq 1 ]] || configure_hypervisor
     [[ "$ADOPT_VENDOR_LOADER" -eq 0 ]] || doctor --adopt-vendor-loader
     # No SELinux/AppArmor or CrowdSec configuration changes without explicit scope.
     if [[ "$NO_CROWDSEC" -eq 0 ]]; then install_crowdsec; fi

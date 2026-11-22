@@ -46,6 +46,10 @@ DEFAULTS: dict[str, dict[str, str]] = {
         "CONTAINER_MODE": "0",
         "CONTAINER_POLICY": "open",
     },
+    "hypervisor": {
+        "HYPERVISOR_MODE": "0",
+        "VM_POLICY": "open",
+    },
     "crowdsec": {
         "ENABLED": "1",
         "API_URL": "http://127.0.0.1:8080",
@@ -77,11 +81,18 @@ class FwsecConfig:
     deny_limit: int = 1000
     container_mode: bool = False
     container_policy: str = "open"
+    hypervisor_mode: bool = False
+    vm_policy: str = "open"
     crowdsec_enabled: bool = True
     crowdsec_api: str = "http://127.0.0.1:8080"
     crowdsec_sync_deny: bool = True
     log_file: Path = Path("/var/log/fwsec.log")
     log_level: str = "INFO"
+
+
+def forwarding(c: FwsecConfig) -> bool:
+    """Container or hypervisor hosts keep the forward chain permissive."""
+    return c.container_mode or c.hypervisor_mode
 
 
 def load_config() -> FwsecConfig:
@@ -94,6 +105,7 @@ def load_config() -> FwsecConfig:
 
     fw = parser["firewall"]
     ct = parser["containers"]
+    hv = parser["hypervisor"]
     cs = parser["crowdsec"]
     lg = parser["logging"]
 
@@ -115,6 +127,8 @@ def load_config() -> FwsecConfig:
         deny_limit=fw.getint("DENY_IP_LIMIT", 1000),
         container_mode=ct.getboolean("CONTAINER_MODE", False),
         container_policy=ct.get("CONTAINER_POLICY", "open").strip().lower(),
+        hypervisor_mode=hv.getboolean("HYPERVISOR_MODE", False),
+        vm_policy=hv.get("VM_POLICY", "open").strip().lower(),
         crowdsec_enabled=cs.getboolean("ENABLED", True),
         crowdsec_api=cs.get("API_URL", "http://127.0.0.1:8080"),
         crowdsec_sync_deny=cs.getboolean("SYNC_DENY", True),
